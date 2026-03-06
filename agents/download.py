@@ -8,7 +8,7 @@ identificado por el DatasetDiscoveryAgent.
 Uso:
     python -m agents.download \\
         --input data/discovery/datasets_pancreatic_cancer.json \\
-        --output data/raw/ \\
+        --output-dir data/raw/ \\
         --parallel 4
 """
 
@@ -130,7 +130,7 @@ class DatasetDownloadAgent:
         # Construir URL del matrix file
         # GEO organiza por: GSE1-100, GSE101-200, etc.
         gse_num = int(gse_id.replace("GSE", ""))
-        gse_stub = f"GSE{(gse_num // 1000) * 1000}nnn"
+        gse_stub = f"GSE{str(gse_num)[:-3]}nnn"
         matrix_url = (
             f"{self.NCBI_FTP_BASE}/{gse_stub}/{gse_id}/matrix/"
             f"{gse_id}{self.MATRIX_SUFFIX}"
@@ -373,7 +373,7 @@ class DatasetDownloadAgent:
 
 @click.command()
 @click.option("--input", required=True, help="Path al JSON de descubrimiento (Agent 1)")
-@click.option("--output", default="data/raw/", show_default=True,
+@click.option("--output-dir", default="data/raw/", show_default=True,
               help="Directorio de salida")
 @click.option("--parallel", default=4, show_default=True,
               help="Número de descargas paralelas")
