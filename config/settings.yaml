@@ -105,23 +105,38 @@ pathways:
 
 # --- Agent 7: InsightGeneration ---
 insights:
-  llm_backend: "local"          # local | anthropic | openai
-  local_model: "gemma3:4b"      # llama3:8b | llama3:70b | BioMedLM | gemma3:4b
-  ollama_url: "http://localhost:11434"
-  anthropic_model: "claude-sonnet-4-20250514"
-  openai_model: "gpt-4o"
+  # Backend LLM seleccionable: anthropic | openai | ollama | basic
+  llm_backend: "anthropic"       # ← Cambia aquí para alternar backend
+  backend: "anthropic"           # Alias usado por InsightGenerationAgent
+
+  # Modelos por backend
+  model: "claude-sonnet-4-20250514"   # Usado cuando backend=anthropic
+  openai_model: "gpt-4o"              # Usado cuando backend=openai
+  ollama_url: "http://localhost:11434" # Usado cuando backend=ollama
+  local_model: "gemma3:4b"           # Modelo Ollama local
+
   max_tokens: 4000
   temperature: 0.1              # Baja temperatura para mayor reproducibilidad
+  top_genes_for_context: 20     # Top N genes enviados al LLM como contexto
   top_targets: 5                # Top N targets terapéuticos
   top_hypotheses: 3             # Top N hipótesis experimentales
+
+# LLM block (alias para InsightGenerationAgent — lee de aquí)
+llm:
+  backend: "ollama"           # anthropic | openai | ollama | basic
+  model: "gemma3:4b"         # claude-sonnet-4-20250514 | gemma3:4b
+  ollama_url: "http://localhost:11434"
+  max_tokens: 4000
+  top_genes_for_context: 20
 
 # --- Agent 8: ReportGeneration ---
 report:
   formats:
-    - "pdf"
-    - "json"
-    - "csv"
-    - "markdown"
+    - "json"               # Formato principal de salida
+  # Descomentar para habilitar formatos adicionales:
+  # - "pdf"
+  # - "csv"
+  # - "html"
   pdf_page_size: "A4"
   include_volcano_plots: true
   include_heatmap: true
