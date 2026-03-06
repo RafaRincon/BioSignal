@@ -1,0 +1,130 @@
+# ============================================================
+# BioSignal Discovery Engine — Configuración Global
+# Archivo: config/settings.yaml
+# ============================================================
+
+# --- Pipeline General ---
+pipeline:
+  version: "1.0.0"
+  name: "BioSignal Discovery Engine"
+  log_level: "INFO"           # DEBUG | INFO | WARNING | ERROR
+  parallel_workers: 4         # Número de workers para descarga paralela
+  seed: 42                    # Seed fijo para reproducibilidad
+  max_retries: 3              # Reintentos por dataset fallido
+  retry_backoff: [1, 2, 4]    # Backoff exponencial en segundos
+
+# --- Directorios de Datos ---
+data:
+  base_dir: "data/"
+  discovery_dir: "data/discovery/"
+  raw_dir: "data/raw/"
+  processed_dir: "data/processed/"
+  dea_dir: "data/dea/"
+  meta_dir: "data/meta/"
+  pathways_dir: "data/pathways/"
+  insights_dir: "data/insights/"
+  reports_dir: "data/reports/"
+  review_dir: "data/review/"    # Datasets sin clasificación clara
+
+# --- Agent 1: DatasetDiscovery ---
+discovery:
+  max_datasets: 20              # Máximo datasets a recuperar por consulta
+  min_samples: 10               # Mínimo de muestras por dataset
+  data_types:
+    - "RNA-seq"
+    - "microarray"
+  ranking_weights:
+    citations: 0.4
+    sample_count: 0.4
+    year: 0.2
+  ncbi_email: ""                # Requerido para E-utilities (configurar en .env)
+  ncbi_api_key: ""              # Opcional - permite >3 req/seg
+  ncbi_base_url: "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+# --- Agent 2: DatasetDownload ---
+download:
+  timeout_seconds: 300          # Timeout por dataset
+  verify_md5: true              # Verificar integridad MD5
+  decompress_gz: true           # Auto-descomprimir .gz
+  parallel: 4                   # Descargas paralelas
+
+# --- Agent 3: Preprocessing ---
+preprocessing:
+  # Filtros de calidad
+  min_samples_per_group: 3      # Mínimo muestras por grupo (caso y control)
+  min_genes_detected: 5000      # Mínimo genes detectados
+  max_outlier_fraction: 0.20    # Máximo fracción de outliers (20%)
+  low_expression_threshold: 10  # counts mínimos
+  low_expression_fraction: 0.70 # en qué fracción de muestras
+
+  # Normalización
+  rnaseq_normalization: "TMM"           # TMM | TPM | CPM
+  microarray_normalization: "quantile"  # quantile | RMA
+
+  # Batch correction
+  batch_pve_threshold: 0.30     # Si PVE batch > 30%, aplicar ComBat
+
+  # Outlier detection
+  outlier_zscore_threshold: 3.0 # Z-score Mahalanobis para outliers
+
+# --- Agent 4: Differential Expression ---
+dea:
+  method_rnaseq: "DESeq2"       # DESeq2 | edgeR | wilcoxon
+  method_microarray: "limma"    # limma | wilcoxon
+  method_fallback: "wilcoxon"   # Fallback si el dataset es ambiguo
+
+  # Criterios de significancia
+  padj_threshold: 0.05          # FDR (Benjamini-Hochberg)
+  log2fc_threshold: 1.0         # |log2FoldChange| mínimo (cambio 2x)
+  basemean_threshold: 10        # Expresión mínima detectable
+
+  # Outputs
+  generate_volcano: true
+  volcano_top_genes: 20         # Genes a etiquetar en volcano plot
+
+# --- Agent 5: MetaAnalysis ---
+meta_analysis:
+  method: "fisher"              # fisher | stouffer | vote_counting | REM
+  min_dataset_fraction: 0.60    # Gen presente en ≥60% de datasets
+  direction_threshold: 0.70     # UP si mean(log2FC) > 0 en ≥70% datasets
+  padj_threshold: 0.05
+  generate_heatmap: true
+  heatmap_top_genes: 50
+
+# --- Agent 6: PathwayEnrichment ---
+pathways:
+  databases:
+    - "KEGG_2021_Human"
+    - "GO_Biological_Process_2023"
+    - "Reactome_2022"
+    - "MSigDB_Hallmark_2020"
+  padj_threshold: 0.05
+  gene_ratio_threshold: 0.05
+  top_pathways: 20
+  generate_dotplot: true
+
+# --- Agent 7: InsightGeneration ---
+insights:
+  llm_backend: "local"          # local | anthropic | openai
+  local_model: "gemma3:4b"      # llama3:8b | llama3:70b | BioMedLM | gemma3:4b
+  ollama_url: "http://localhost:11434"
+  anthropic_model: "claude-sonnet-4-20250514"
+  openai_model: "gpt-4o"
+  max_tokens: 4000
+  temperature: 0.1              # Baja temperatura para mayor reproducibilidad
+  top_targets: 5                # Top N targets terapéuticos
+  top_hypotheses: 3             # Top N hipótesis experimentales
+
+# --- Agent 8: ReportGeneration ---
+report:
+  formats:
+    - "pdf"
+    - "json"
+    - "csv"
+    - "markdown"
+  pdf_page_size: "A4"
+  include_volcano_plots: true
+  include_heatmap: true
+  include_pathway_dotplot: true
+  top_genes_table: 50           # Genes en tabla del reporte
+  top_pathways_table: 20        # Pathways en tabla del reporte

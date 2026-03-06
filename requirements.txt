@@ -1,0 +1,77 @@
+# ============================================================
+# BioSignal Discovery Engine — Python Dependencies
+# Version: 1.0 (MVP Local)
+# ============================================================
+
+
+# --- Bioinformatics: GEO / NCBI Access ---
+biopython
+GEOparse
+requests
+urllib3
+
+# --- Data Manipulation ---
+pandas
+numpy
+pyarrow
+fastparquet
+
+# --- Statistical Analysis ---
+scipy
+statsmodels
+
+# --- Bioinformatics: Differential Expression ---
+pydeseq2
+
+# --- Bioinformatics: Pathway Enrichment ---
+gseapy
+
+# --- Machine Learning / PCA / Clustering ---
+scikit-learn
+
+# --- LLM Orchestration ---
+langchain
+langchain-openai
+langchain-anthropic
+openai
+anthropic
+
+# --- Visualization ---
+matplotlib
+seaborn
+plotly
+
+# --- Report Generation ---
+reportlab
+fpdf2
+
+# --- R Bridge (for DESeq2/limma via rpy2) ---
+rpy2
+
+# --- Validation & Schemas ---
+pydantic
+pydantic-settings
+
+# --- CLI ---
+click
+typer
+rich
+
+# --- Logging ---
+loguru
+
+# --- Config ---
+python-dotenv
+PyYAML
+
+# --- Testing ---
+pytest
+pytest-cov
+pytest-mock
+
+# --- Development ---
+black
+flake8
+mypy
+ipykernel
+jupyterlab

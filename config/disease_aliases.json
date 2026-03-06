@@ -1,0 +1,77 @@
+{
+  "_comment": "Mapeo de nombres comunes de enfermedades a términos canónicos de GEO/NCBI",
+  "_version": "1.0",
+
+  "cancer": {
+    "pancreatic cancer":     "pancreatic cancer expression profiling",
+    "pancreatic ductal":     "pancreatic ductal adenocarcinoma expression profiling",
+    "lung cancer":           "lung cancer expression profiling",
+    "nsclc":                 "non-small cell lung cancer expression profiling",
+    "breast cancer":         "breast cancer expression profiling",
+    "colorectal cancer":     "colorectal cancer expression profiling",
+    "colon cancer":          "colon cancer expression profiling",
+    "liver cancer":          "hepatocellular carcinoma expression profiling",
+    "hcc":                   "hepatocellular carcinoma expression profiling",
+    "glioblastoma":          "glioblastoma expression profiling",
+    "gbm":                   "glioblastoma multiforme expression profiling",
+    "ovarian cancer":        "ovarian cancer expression profiling",
+    "prostate cancer":       "prostate cancer expression profiling",
+    "melanoma":              "melanoma expression profiling",
+    "leukemia":              "leukemia expression profiling",
+    "aml":                   "acute myeloid leukemia expression profiling",
+    "lymphoma":              "lymphoma expression profiling"
+  },
+
+  "neurodegenerative": {
+    "alzheimer":             "alzheimer disease expression profiling",
+    "alzheimer disease":     "alzheimer disease expression profiling",
+    "parkinson":             "parkinson disease expression profiling",
+    "parkinson disease":     "parkinson disease expression profiling",
+    "als":                   "amyotrophic lateral sclerosis expression profiling",
+    "huntington":            "huntington disease expression profiling",
+    "multiple sclerosis":    "multiple sclerosis expression profiling"
+  },
+
+  "metabolic": {
+    "diabetes":              "type 2 diabetes expression profiling",
+    "type 2 diabetes":       "type 2 diabetes expression profiling",
+    "type 1 diabetes":       "type 1 diabetes expression profiling",
+    "obesity":               "obesity expression profiling",
+    "nafld":                 "non-alcoholic fatty liver disease expression profiling",
+    "nash":                  "non-alcoholic steatohepatitis expression profiling"
+  },
+
+  "cardiovascular": {
+    "heart failure":         "heart failure expression profiling",
+    "myocardial infarction": "myocardial infarction expression profiling",
+    "mi":                    "myocardial infarction expression profiling",
+    "atherosclerosis":       "atherosclerosis expression profiling",
+    "hypertension":          "hypertension expression profiling"
+  },
+
+  "inflammatory": {
+    "rheumatoid arthritis":  "rheumatoid arthritis expression profiling",
+    "ra":                    "rheumatoid arthritis expression profiling",
+    "crohn disease":         "crohn disease expression profiling",
+    "ibd":                   "inflammatory bowel disease expression profiling",
+    "ulcerative colitis":    "ulcerative colitis expression profiling",
+    "lupus":                 "systemic lupus erythematosus expression profiling",
+    "sle":                   "systemic lupus erythematosus expression profiling",
+    "sepsis":                "sepsis expression profiling"
+  },
+
+  "infectious": {
+    "covid":                 "COVID-19 expression profiling",
+    "covid-19":              "COVID-19 expression profiling",
+    "sars-cov-2":            "SARS-CoV-2 expression profiling",
+    "tuberculosis":          "tuberculosis expression profiling",
+    "hiv":                   "HIV expression profiling"
+  },
+
+  "rare": {
+    "cystic fibrosis":       "cystic fibrosis expression profiling",
+    "cf":                    "cystic fibrosis expression profiling",
+    "duchenne":              "duchenne muscular dystrophy expression profiling",
+    "dmd":                   "duchenne muscular dystrophy expression profiling"
+  }
+}
