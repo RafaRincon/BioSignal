@@ -169,7 +169,7 @@ class ReportGenerationAgent:
             "disease": disease_name,
             "analysis_date": datetime.utcnow().strftime("%Y-%m-%d"),
             "pipeline_version": self.VERSION,
-            "consensus_genes": consensus_genes.get("genes", []) if consensus_genes else [],
+            "consensus_genes": consensus_genes.get("consensus_genes", []) if consensus_genes else [],
             "meta_results_df": meta_results,
             "top_pathways": top_pathways if top_pathways else {},
             "executive_summary": insights.get("executive_summary", "") if insights else "",
@@ -476,7 +476,7 @@ class ReportGenerationAgent:
     def _load_json_safe(self, path: Path) -> Optional[dict]:
         if path and path.exists():
             try:
-                with open(path) as f:
+                with open(path, encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
                 logger.warning(f"Error cargando {path}: {e}")

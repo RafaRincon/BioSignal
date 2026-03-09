@@ -30,7 +30,7 @@ def load_config(config_path: str = "config/settings.yaml") -> dict:
     if not config_file.exists():
         logger.warning(f"Config no encontrada en {config_path}. Usando defaults.")
         return {}
-    with open(config_file) as f:
+    with open(config_file, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 

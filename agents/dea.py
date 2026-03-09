@@ -24,15 +24,29 @@ from loguru import logger
 try:
     import rpy2.robjects as ro
     from rpy2.robjects import pandas2ri, Formula
+    from rpy2.robjects.conversion import localconverter
     from rpy2.robjects.packages import importr
     from rpy2.rinterface_lib.callbacks import logger as rpy2_logger
     import logging
-    rpy2_logger.setLevel(logging.ERROR)  # Silenciar warnings de R
-    pandas2ri.activate()
+    rpy2_logger.setLevel(logging.ERROR)
+
+    # Conversor activo para toda la sesión (compatible con rpy2 >= 3.5)
+    _converter = ro.default_converter + pandas2ri.converter
+
+    def py2r(df):
+        """Convierte pandas DataFrame a R object."""
+        with localconverter(_converter):
+            return ro.conversion.py2rpy(df)
+
+    def r2py(r_obj):
+        """Convierte R object a pandas DataFrame."""
+        with localconverter(_converter):
+            return ro.conversion.rpy2py(r_obj)
+
     RPY2_AVAILABLE = True
 except ImportError:
     RPY2_AVAILABLE = False
-    logger.warning("rpy2 no disponible — DEA usará método Python fallback (limma-like via statsmodels)")
+    logger.warning("rpy2 no disponible — DEA usará método Python fallback")
 
 
 class DifferentialExpressionAgent:
@@ -130,7 +144,11 @@ class DifferentialExpressionAgent:
         gse_id = dataset_dir.name
 
         # Cargar datos
-        matrix = pd.read_csv(dataset_dir / "matrix_normalized.csv", index_col=0)
+        # Para edgeR: usar counts crudos si están disponibles
+        counts_path = dataset_dir / "matrix_counts.csv"
+        matrix_path = dataset_dir / "matrix_normalized.csv"
+        matrix = pd.read_csv(counts_path if counts_path.exists() else matrix_path, index_col=0)
+        matrix_norm = pd.read_csv(matrix_path, index_col=0)  # Para limma/ttest
         sample_meta = self._load_sample_metadata(dataset_dir)
 
         if sample_meta is None or "group" not in sample_meta.columns:
@@ -153,8 +171,9 @@ class DifferentialExpressionAgent:
         logger.info(f"[{gse_id}] Método DEA: {method} | Data type: {data_type}")
 
         # Ejecutar DEA — cadena: edgeR → limma → t-test
+        # edgeR usa counts crudos; limma/ttest usan matriz normalizada
         if method == "edger" and RPY2_AVAILABLE:
-            results_df = self._run_edger(matrix, sample_meta, gse_id)
+            results_df = self._run_edger(matrix, matrix_norm, sample_meta, gse_id)
         elif method == "deseq2" and RPY2_AVAILABLE:
             results_df = self._run_deseq2(matrix, sample_meta, gse_id)
         elif method == "limma" and RPY2_AVAILABLE:
@@ -203,7 +222,7 @@ class DifferentialExpressionAgent:
     # edgeR via rpy2  (método principal)
     # ------------------------------------------------------------------
 
-    def _run_edger(self, matrix: pd.DataFrame, sample_meta: pd.DataFrame, gse_id: str) -> pd.DataFrame:
+    def _run_edger(self, matrix: pd.DataFrame, matrix_norm: pd.DataFrame, sample_meta: pd.DataFrame, gse_id: str) -> pd.DataFrame:
         """
         Ejecuta edgeR via rpy2.
         Usa exactTest para diseño simple (2 grupos) y glmQLFTest si hay covariables.
@@ -211,6 +230,13 @@ class DifferentialExpressionAgent:
         try:
             edgeR = importr("edgeR")
             base = importr("base")
+
+            # Alinear metadata con columnas de la matriz (pueden diferir por outliers removidos)
+            common = [c for c in matrix.columns if c in sample_meta.index]
+            if len(common) < 4:
+                raise ValueError(f"Solo {len(common)} muestras alineadas — mínimo 4")
+            matrix = matrix[common]
+            sample_meta = sample_meta.loc[common]
 
             # edgeR requiere counts crudos (enteros)
             counts_int = matrix.round().astype(int).clip(lower=0)
@@ -220,12 +246,15 @@ class DifferentialExpressionAgent:
             group_factor = ro.FactorVector(groups, levels=ro.StrVector(ordered_groups))
 
             # Crear DGEList
-            r_counts = pandas2ri.py2rpy(counts_int)
+            with localconverter(ro.default_converter + pandas2ri.converter):
+                r_counts = ro.conversion.py2rpy(counts_int)
             dge = edgeR.DGEList(counts=r_counts, group=group_factor)
 
             # Filtrar genes de baja expresión con filterByExpr
             keep = edgeR.filterByExpr(dge)
-            dge = base.subset(dge, keep, )
+            ro.globalenv["dge"] = dge
+            ro.globalenv["keep"] = keep
+            dge = ro.r("dge[keep, , keep.lib.sizes=FALSE]")
 
             # Normalización TMM
             dge = edgeR.calcNormFactors(dge, method="TMM")
@@ -236,7 +265,7 @@ class DifferentialExpressionAgent:
             # exactTest (2 grupos)
             et = edgeR.exactTest(dge, pair=ro.StrVector(ordered_groups))
             top_table = edgeR.topTags(et, n=matrix.shape[0], sort_by="PValue")
-            top_df = pandas2ri.rpy2py(base.as_data_frame(top_table.rx2("table"))).reset_index()
+            top_df = r2py(base.as_data_frame(top_table.rx2("table"))).reset_index()
 
             # Renombrar columnas al estándar interno
             top_df.columns = ["gene"] + list(top_df.columns[1:])
@@ -247,7 +276,7 @@ class DifferentialExpressionAgent:
 
         except Exception as e:
             logger.warning(f"[{gse_id}] edgeR falló ({e}), intentando limma")
-            return self._run_limma(matrix, sample_meta, gse_id)
+            return self._run_limma(matrix_norm, sample_meta, gse_id)
 
 
 
@@ -268,7 +297,8 @@ class DifferentialExpressionAgent:
             col_data.rownames = ro.StrVector(sample_meta.index.tolist())
 
             # Crear DESeqDataSet
-            r_counts = pandas2ri.py2rpy(counts_int)
+            with localconverter(ro.default_converter + pandas2ri.converter):
+                r_counts = ro.conversion.py2rpy(counts_int)
             dds = deseq2.DESeqDataSetFromMatrix(
                 countData=r_counts,
                 colData=col_data,
@@ -282,7 +312,7 @@ class DifferentialExpressionAgent:
             groups = sample_meta["group"].unique().tolist()
             contrast = ro.StrVector(["condition"] + self._order_groups(groups))
             res = deseq2.results(dds, contrast=contrast)
-            res_df = pandas2ri.rpy2py(base.as_data_frame(res))
+            res_df = r2py(base.as_data_frame(res))
 
             res_df = res_df.reset_index()
             res_df.columns = ["gene", "baseMean", "log2FC", "lfcSE", "stat", "pvalue", "padj"]
@@ -304,6 +334,12 @@ class DifferentialExpressionAgent:
             limma = importr("limma")
             base = importr("base")
 
+            # Alinear metadata con columnas de la matriz
+            common = [c for c in matrix.columns if c in sample_meta.index]
+            if len(common) >= 4:
+                matrix = matrix[common]
+                sample_meta = sample_meta.loc[common]
+
             groups = sample_meta["group"].tolist()
             ordered_groups = self._order_groups(sample_meta["group"].unique().tolist())
             group_factor = ro.FactorVector(groups, levels=ro.StrVector(ordered_groups))
@@ -311,12 +347,12 @@ class DifferentialExpressionAgent:
             design = limma.model_matrix(Formula("~ group_factor"),
                                         data=ro.DataFrame({"group_factor": group_factor}))
 
-            r_matrix = pandas2ri.py2rpy(matrix.astype(float))
+            r_matrix = py2r(matrix.astype(float))
             fit = limma.lmFit(r_matrix, design)
             fit = limma.eBayes(fit)
 
             top_table = limma.topTable(fit, coef=2, number=matrix.shape[0], sort_by="P", adjust_method="BH")
-            top_df = pandas2ri.rpy2py(top_table).reset_index()
+            top_df = r2py(top_table).reset_index()
             top_df.columns = ["gene"] + list(top_df.columns[1:])
 
             # Renombrar columnas estándar

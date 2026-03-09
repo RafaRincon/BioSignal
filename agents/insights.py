@@ -117,7 +117,7 @@ class InsightGenerationAgent:
             else:
                 return {}
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 return yaml.safe_load(f) or {}
         except Exception as e:
             logger.warning(f"[InsightAgent] No se pudo cargar {path}: {e}")
@@ -251,7 +251,7 @@ class InsightGenerationAgent:
 
         therapeutic_targets = insights.get("therapeutic_targets", [])
 
-        with open(out_dir / "biological_insights.json", "w") as f:
+        with open(out_dir / "biological_insights.json", "w", encoding="utf-8") as f:
             json.dump(insights, f, indent=2, ensure_ascii=False)
 
         with open(out_dir / "therapeutic_targets.json", "w") as f:
@@ -573,9 +573,9 @@ with this exact structure (no markdown, no backticks):
         consensus_path = meta_dir / "consensus_genes.json"
         if not consensus_path.exists():
             return []
-        with open(consensus_path) as f:
+        with open(consensus_path, encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("genes", [])
+        return data.get("consensus_genes", [])
 
     def _load_top_pathways(self, pathways_dir: Path) -> dict:
         summary_path = pathways_dir / "top_pathways_summary.json"

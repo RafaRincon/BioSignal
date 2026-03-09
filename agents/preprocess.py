@@ -125,12 +125,12 @@ class PreprocessingAgent:
 
         # Pipeline según tipo de dato
         if data_type == "RNA-seq":
-            matrix, qc = self._process_rnaseq(matrix, gse_id)
+            matrix, qc, counts_raw = self._process_rnaseq(matrix, gse_id)
         else:
-            matrix, qc = self._process_microarray(matrix, gse_id)
+            matrix, qc, counts_raw = self._process_microarray(matrix, gse_id)
 
         # Validar muestras mínimas por grupo
-        sample_meta = self._load_sample_metadata(dataset_dir)
+        sample_meta = self._load_sample_metadata(dataset_dir, matrix_cols=matrix.columns.tolist())
         group_check = self._check_group_balance(sample_meta, gse_id)
         qc.update(group_check)
 
@@ -148,6 +148,8 @@ class PreprocessingAgent:
 
         # Guardar outputs
         matrix.to_csv(out_dir / "matrix_normalized.csv")
+        if counts_raw is not None:
+            counts_raw.to_csv(out_dir / "matrix_counts.csv")
         if sample_meta is not None:
             sample_meta.to_csv(out_dir / "sample_metadata.csv")
 
@@ -163,7 +165,7 @@ class PreprocessingAgent:
     # Pipeline RNA-seq
     # ------------------------------------------------------------------
 
-    def _process_rnaseq(self, matrix: pd.DataFrame, gse_id: str) -> tuple[pd.DataFrame, dict]:
+    def _process_rnaseq(self, matrix: pd.DataFrame, gse_id: str) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
         """Normalización y filtrado para datos de RNA-seq (counts)."""
         qc = {"data_type": "RNA-seq"}
         qc["genes_raw"] = matrix.shape[0]
@@ -176,13 +178,16 @@ class PreprocessingAgent:
         qc["genes_after_lowexpr_filter"] = matrix.shape[0]
         logger.debug(f"[{gse_id}] Genes tras filtro baja expresión: {matrix.shape[0]}")
 
+        # Guardar counts filtrados (antes de normalizar) para edgeR
+        counts_filtered = matrix.copy()
+
         # 2. Normalización log2(CPM + 1)
         col_sums = matrix.sum(axis=0)
         cpm = matrix.div(col_sums, axis=1) * 1e6
         matrix_norm = np.log2(cpm + 1)
         qc["normalization"] = "log2(CPM+1)"
 
-        return matrix_norm, qc
+        return matrix_norm, qc, counts_filtered
 
     # ------------------------------------------------------------------
     # Pipeline Microarray
@@ -255,6 +260,7 @@ class PreprocessingAgent:
     def _load_expression_matrix(self, dataset_dir: Path) -> Optional[pd.DataFrame]:
         """Carga la matriz de expresión desde archivos GEO."""
         candidates = [
+            ("matrix_counts.tsv", "\t"),  # Counts suplementarios consolidados (SRA)
             ("matrix.tsv", "\t"),
             ("matrix.csv", ","),
             ("expression_matrix.csv", ","),
@@ -343,32 +349,56 @@ class PreprocessingAgent:
 
         return meta
 
-    def _load_sample_metadata(self, dataset_dir: Path) -> Optional[pd.DataFrame]:
-        """Carga metadata de muestras. Lee desde metadata.json si no hay CSV separado."""
-        # Primero buscar CSV dedicado
+    def _load_sample_metadata(self, dataset_dir: Path, matrix_cols: list = None) -> Optional[pd.DataFrame]:
+        """
+        Carga metadata de muestras. Intenta alinear el índice con las columnas
+        de la matriz (que pueden ser títulos en lugar de GSM IDs).
+        """
         for fname in ["sample_metadata.csv", "samples.csv", "phenodata.csv"]:
             fpath = dataset_dir / fname
             if fpath.exists():
                 return pd.read_csv(fpath, index_col=0)
 
-        # Construir desde metadata.json (formato del Agent 2)
         meta_path = dataset_dir / "metadata.json"
-        if meta_path.exists():
-            with open(meta_path) as f:
-                meta = json.load(f)
-            samples = meta.get("samples", [])
-            if samples:
-                rows = []
-                for s in samples:
-                    rows.append({
-                        "sample_id": s.get("gsm_id", ""),
-                        "title": s.get("title", ""),
-                        "group": s.get("label", "unknown"),  # 'case' | 'control'
-                    })
-                df = pd.DataFrame(rows).set_index("sample_id")
-                return df
+        if not meta_path.exists():
+            return None
 
-        return None
+        with open(meta_path) as f:
+            meta = json.load(f)
+
+        all_samples = meta.get("samples", []) + meta.get("unclassified", [])
+        if not all_samples:
+            return None
+
+        rows = []
+        for s in all_samples:
+            rows.append({
+                "gsm_id": s.get("gsm_id", ""),
+                "title": s.get("title", ""),
+                "group": s.get("label", "unclassified"),
+            })
+        df = pd.DataFrame(rows)
+
+        if matrix_cols:
+            # Caso 1: columnas son GSM IDs
+            if df["gsm_id"].isin(matrix_cols).any():
+                return df.set_index("gsm_id")[["group"]]
+            # Caso 2: columnas son títulos — limpiar prefijos tipo "A2712: "
+            df["title_clean"] = df["title"].str.split(": ").str[-1].str.strip()
+            if df["title_clean"].isin(matrix_cols).any():
+                return df.set_index("title_clean")[["group"]]
+            # Caso 3: match por substring
+            title_map = {}
+            for col in matrix_cols:
+                for _, row in df.iterrows():
+                    tc = str(row["title_clean"])
+                    if col in row["title"] or tc in col or col in tc:
+                        title_map[col] = row["group"]
+                        break
+            if title_map:
+                return pd.DataFrame({"group": title_map})
+
+        return df.set_index("gsm_id")[["group"]]
 
     def _check_group_balance(self, sample_meta: Optional[pd.DataFrame], gse_id: str) -> dict:
         """Verifica que haya suficientes muestras por grupo."""

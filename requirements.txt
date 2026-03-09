@@ -9,6 +9,7 @@ biopython
 GEOparse
 requests
 urllib3
+mygene
 
 # --- Data Manipulation ---
 pandas

@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+
 import click
 import numpy as np
 import pandas as pd
@@ -59,6 +60,93 @@ class MetaAnalysisAgent:
         self.generate_heatmap = self.config.get("generate_heatmap", True)
         self.heatmap_top_genes = self.config.get("heatmap_top_genes", 50)
 
+    def _detect_namespace(self, genes: list[str]) -> str:
+        """Detecta el namespace de los gene IDs: 'ensembl_human', 'ensembl_mouse', o 'symbol'."""
+        sample = [g for g in genes[:50] if isinstance(g, str)]
+        n_human = sum(1 for g in sample if g.startswith("ENSG"))
+        n_mouse = sum(1 for g in sample if g.startswith("ENSMUSG"))
+        if n_human / max(len(sample), 1) > 0.5:
+            return "ensembl_human"
+        if n_mouse / max(len(sample), 1) > 0.5:
+            return "ensembl_mouse"
+        return "symbol"
+
+    def normalize_gene_ids(self, df: pd.DataFrame, gse_id: str) -> pd.DataFrame:
+        """
+        Normaliza gene IDs a human gene symbols usando mygene.
+        Handles: ENSG* → symbol, ENSMUSG* → human ortholog symbol, symbol → symbol.
+        """
+        import mygene
+        mg = mygene.MyGeneInfo()
+
+        genes = df["gene"].dropna().unique().tolist()
+        namespace = self._detect_namespace(genes)
+
+        if namespace == "symbol":
+            logger.debug(f"  [{gse_id}] Gene IDs ya son symbols — sin conversión")
+            return df
+
+        logger.info(f"  [{gse_id}] Convirtiendo {len(genes)} IDs ({namespace}) → human symbols...")
+
+        # Strip versiones tipo ENSMUSG00000030516.14 → ENSMUSG00000030516
+        genes_clean = [g.split(".")[0] if "." in g else g for g in genes]
+        original_map = dict(zip(genes_clean, genes))  # clean → original
+
+        symbol_map = {}  # original_id → human_symbol
+
+        try:
+            if namespace == "ensembl_human":
+                hits = mg.querymany(
+                    genes_clean,
+                    scopes="ensembl.gene",
+                    fields="symbol",
+                    species="human",
+                    verbose=False,
+                )
+                for hit in hits:
+                    if hit.get("notfound"):
+                        continue
+                    original = original_map.get(hit["query"], hit["query"])
+                    sym = hit.get("symbol")
+                    if sym:
+                        symbol_map[original] = sym
+
+            else:  # ensembl_mouse
+                hits = mg.querymany(
+                    genes_clean,
+                    scopes="ensembl.gene",
+                    fields="symbol,ortholog.human",
+                    species="mouse",
+                    verbose=False,
+                )
+                for hit in hits:
+                    if hit.get("notfound"):
+                        continue
+                    original = original_map.get(hit["query"], hit["query"])
+                    ortho = hit.get("ortholog", {}).get("human") if isinstance(hit.get("ortholog"), dict) else None
+                    if isinstance(ortho, list):
+                        sym = ortho[0].get("symbol") if ortho else None
+                    elif isinstance(ortho, dict):
+                        sym = ortho.get("symbol")
+                    else:
+                        sym = hit.get("symbol")  # fallback: símbolo ratón
+                    if sym:
+                        symbol_map[original] = sym
+
+        except Exception as e:
+            logger.warning(f"  [{gse_id}] mygene falló: {e} — manteniendo IDs originales")
+            return df
+
+        logger.info(f"  [{gse_id}] Mapeados {len(symbol_map)}/{len(genes)} genes → symbols")
+
+        df = df.copy()
+        df["gene"] = df["gene"].map(
+            lambda g: symbol_map.get(g, symbol_map.get(g.split(".")[0] if "." in g else g))
+        )
+        df = df.dropna(subset=["gene"])
+        df = df.sort_values("pvalue").drop_duplicates(subset="gene", keep="first")
+        return df
+
     def load_dea_results(self, dea_dir: str) -> dict[str, pd.DataFrame]:
         """
         Carga resultados de DEA de todos los datasets disponibles.
@@ -92,8 +180,9 @@ class MetaAnalysisAgent:
                     logger.warning(f"  {gse_id}: columnas faltantes {required - set(df.columns)}")
                     continue
 
+                df = self.normalize_gene_ids(df, gse_id)
                 results[gse_id] = df
-                logger.debug(f"  {gse_id}: {len(df)} genes cargados")
+                logger.debug(f"  {gse_id}: {len(df)} genes cargados (post-normalization)")
 
             except Exception as e:
                 logger.error(f"  Error cargando {gse_id}: {e}")

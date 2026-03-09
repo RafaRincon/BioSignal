@@ -65,6 +65,7 @@ class PathwayEnrichmentAgent:
         self.min_gene_ratio = self.config.get("min_gene_ratio", 0.05)
         self.top_n_pathways = self.config.get("top_n_pathways", 20)
         self.enrichr_timeout = self.config.get("enrichr_timeout", 30)
+        self.organism = self.config.get("organism", "human")
 
     # ------------------------------------------------------------------
     # Entrada principal
@@ -128,8 +129,8 @@ class PathwayEnrichmentAgent:
         with open(consensus_path) as f:
             consensus = json.load(f)
 
-        genes_up = [g["gene"] for g in consensus.get("genes", []) if g.get("direction") == "UP"]
-        genes_down = [g["gene"] for g in consensus.get("genes", []) if g.get("direction") == "DOWN"]
+        genes_up = [g["gene"] for g in consensus.get("consensus_genes", []) if g.get("direction") == "UP"]
+        genes_down = [g["gene"] for g in consensus.get("consensus_genes", []) if g.get("direction") == "DOWN"]
         all_genes = genes_up + genes_down
 
         logger.info(f"[{disease_name}] Genes UP={len(genes_up)}, DOWN={len(genes_down)}")
@@ -201,7 +202,7 @@ class PathwayEnrichmentAgent:
                 enr = gp.enrichr(
                     gene_list=gene_list,
                     gene_sets=db_name,
-                    organism="Human",
+                    organism=self.organism,
                     outdir=None,
                     no_plot=True,
                     verbose=False,

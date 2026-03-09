@@ -52,13 +52,17 @@ class DatasetDownloadAgent:
     # Keywords para clasificar muestras como "control"
     CONTROL_KEYWORDS = [
         "control", "normal", "healthy", "non-tumor", "adjacent",
-        "wild type", "wt", "vehicle", "untreated", "mock"
+        "wild type", "wt", "vehicle", "untreated", "mock",
+        "_c_", " ckp", "ckp_", "wildtype", "parental", "scramble",
+        "empty vector", "gfp", "lacz", "dmso", "sictl", "shctl"
     ]
 
     # Keywords para clasificar muestras como "case"
     CASE_KEYWORDS = [
         "tumor", "cancer", "disease", "patient", "treated",
-        "knockdown", "knockout", "kd", "ko", "mutant", "overexpression"
+        "knockdown", "knockout", "kd", "ko", "mutant", "overexpression",
+        "cckp", "gckp", "sirna", "shrna", "lnd", "sr4", "inhibitor",
+        "drug", "stimulated", "infected", "transfected", "overexpr"
     ]
 
     def __init__(self, config: dict = None):
@@ -147,6 +151,19 @@ class DatasetDownloadAgent:
 
         # Parsear con GEOparse para extraer metadata
         gse = GEOparse.get_GEO(geo=gse_id, destdir=str(dataset_dir), silent=True)
+
+        # Detectar si es RNA-seq SRA (sin counts en series matrix)
+        if self._is_sra_rnaseq(gse) and not self._matrix_has_counts(matrix_path):
+            logger.info(f"[{gse_id}] RNA-seq SRA detectado — descargando supplementary counts")
+            consolidated = self._download_and_consolidate_counts(gse, gse_id, dataset_dir)
+            if consolidated is not None and not consolidated.empty:
+                logger.success(
+                    f"[{gse_id}] Counts consolidados: "
+                    f"{consolidated.shape[0]} genes x {consolidated.shape[1]} muestras"
+                )
+                consolidated.to_csv(matrix_path, sep="\t")
+            else:
+                logger.warning(f"[{gse_id}] No se pudieron consolidar counts supplementary")
 
         # Extraer y guardar metadata de muestras
         metadata = self._extract_metadata(gse)
@@ -253,22 +270,237 @@ class DatasetDownloadAgent:
     def _classify_sample(self, sample_text: str) -> str:
         """
         Clasifica una muestra como 'control', 'case' o 'unclassified'.
-
-        Args:
-            sample_text: Texto concatenado de los metadatos de la muestra
+        Ordena keywords por longitud descendente para que matches más específicos
+        (ej. 'cckp') tengan prioridad sobre matches más cortos (ej. 'ckp').
 
         Returns:
             'control' | 'case' | 'unclassified'
         """
-        control_score = sum(1 for kw in self.CONTROL_KEYWORDS if kw in sample_text)
-        case_score = sum(1 for kw in self.CASE_KEYWORDS if kw in sample_text)
+        # Ordenar por longitud desc para priorizar keywords más específicos
+        case_keywords_sorted = sorted(self.CASE_KEYWORDS, key=len, reverse=True)
+        control_keywords_sorted = sorted(self.CONTROL_KEYWORDS, key=len, reverse=True)
 
-        if control_score > case_score:
+        case_matches = [kw for kw in case_keywords_sorted if kw in sample_text]
+        control_matches = [kw for kw in control_keywords_sorted if kw in sample_text]
+
+        # Si hay match de case más específico (más largo) que el de control, es case
+        if case_matches and control_matches:
+            if len(case_matches[0]) >= len(control_matches[0]):
+                return "case"
             return "control"
-        elif case_score > control_score:
+        elif case_matches:
             return "case"
+        elif control_matches:
+            return "control"
+        return "unclassified"
+
+
+    # ------------------------------------------------------------------
+    # SRA RNA-seq: detección y consolidación de counts suplementarios
+    # ------------------------------------------------------------------
+
+    def _is_sra_rnaseq(self, gse) -> bool:
+        """Detecta si el dataset es RNA-seq almacenado en SRA (sin counts en series matrix)."""
+        for gsm_id, gsm in gse.gsms.items():
+            sample_type = gsm.metadata.get("type", [""])[0]
+            library_strategy = gsm.metadata.get("library_strategy", [""])[0]
+            if sample_type == "SRA" or "RNA-Seq" in library_strategy:
+                return True
+        return False
+
+    def _matrix_has_counts(self, matrix_path: Path) -> bool:
+        """
+        Verifica si el matrix.tsv contiene genes reales (no solo headers).
+        Un GEO Series Matrix de RNA-seq SRA tiene !series_matrix_table_begin
+        pero 0 filas de datos — eso NO cuenta como counts válidos.
+        """
+        if not matrix_path.exists():
+            return False
+        in_table = False
+        with open(matrix_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip().lower()
+                if stripped == "!series_matrix_table_begin":
+                    in_table = True
+                    continue
+                if stripped == "!series_matrix_table_end":
+                    break
+                if in_table and stripped and not stripped.startswith("!"):
+                    # Esta es la línea de header (ID_REF ...), saltarla
+                    # La siguiente línea con datos sería un gen real
+                    # Leer una línea más para confirmar
+                    next_line = f.readline().strip()
+                    if next_line and not next_line.startswith("!"):
+                        return True  # Hay al menos un gen
+                    return False
+        return False
+
+    def _download_and_consolidate_counts(self, gse, gse_id: str, dataset_dir: Path):
+        """
+        Descarga archivos suplementarios de counts por muestra y los consolida
+        en una matriz genes x muestras.
+
+        Soporta dos estrategias:
+            1. GSE*_RAW.tar — archivo con todos los counts por muestra
+            2. Archivos individuales por GSM desde supplementary_file en metadata
+        """
+        import tarfile
+        import pandas as pd
+
+        suppl_dir = dataset_dir / "suppl"
+        suppl_dir.mkdir(exist_ok=True)
+
+        # Estrategia 1: descargar GSE*_RAW.tar
+        gse_num = int(gse_id.replace("GSE", ""))
+        gse_stub = f"GSE{str(gse_num)[:-3]}nnn"
+        raw_tar_url = (
+            f"{self.NCBI_FTP_BASE}/{gse_stub}/{gse_id}/suppl/{gse_id}_RAW.tar"
+        )
+
+        tar_path = suppl_dir / f"{gse_id}_RAW.tar"
+        try:
+            logger.info(f"[{gse_id}] Descargando {gse_id}_RAW.tar...")
+            self._download_file(raw_tar_url, tar_path)
+
+            # Extraer archivos de counts (.txt.gz, .tsv.gz, .count.gz)
+            with tarfile.open(tar_path) as tar:
+                count_files = [
+                    m for m in tar.getmembers()
+                    if any(m.name.endswith(ext) for ext in [".txt.gz", ".tsv.gz", ".count.gz", ".counts.gz"])
+                ]
+                tar.extractall(path=suppl_dir, members=count_files)
+
+            tar_path.unlink(missing_ok=True)
+
+        except Exception as e:
+            logger.warning(f"[{gse_id}] No se pudo descargar RAW.tar: {e}")
+            # Estrategia 2: archivos supplementary a nivel GSE
+            gse_suppl = gse.metadata.get("supplementary_file", [])
+            if gse_suppl:
+                logger.info(f"[{gse_id}] Intentando supplementary a nivel GSE: {len(gse_suppl)} archivos")
+                for url in gse_suppl:
+                    if not url or url == "NONE":
+                        continue
+                    fname = url.split("/")[-1]
+                    dest = suppl_dir / fname
+                    if not dest.exists():
+                        try:
+                            # Convertir ftp:// a https://
+                            https_url = url.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
+                            self._download_file(https_url, dest)
+                            logger.debug(f"[{gse_id}] Descargado: {fname}")
+                        except Exception as e2:
+                            logger.warning(f"[{gse_id}] Error descargando {fname}: {e2}")
+            else:
+                # Estrategia 3: archivos individuales por GSM
+                self._download_gsm_supplementary(gse, suppl_dir)
+
+        # Consolidar archivos de counts en matriz
+        return self._consolidate_count_files(suppl_dir, gse, gse_id)
+
+    def _download_gsm_supplementary(self, gse, suppl_dir: Path):
+        """Descarga archivos supplementary individuales de cada GSM."""
+        for gsm_id, gsm in gse.gsms.items():
+            suppl_files = gsm.metadata.get("supplementary_file_1", [])
+            for url in suppl_files:
+                if not url or url == "NONE":
+                    continue
+                fname = url.split("/")[-1]
+                dest = suppl_dir / fname
+                if dest.exists():
+                    continue
+                try:
+                    self._download_file(url, dest)
+                    logger.debug(f"Descargado: {fname}")
+                except Exception as e:
+                    logger.warning(f"Error descargando {fname}: {e}")
+
+    def _consolidate_count_files(self, suppl_dir: Path, gse, gse_id: str):
+        """
+        Lee todos los archivos de counts en suppl_dir y construye
+        una matriz genes x muestras.
+
+        Soporta 3 formatos:
+            1. Un archivo por muestra (GSM*.txt.gz) — columna única de counts
+            2. Matriz completa en un solo archivo (genes x muestras) con header
+            3. Múltiples archivos con múltiples columnas — se concatenan
+        """
+        import pandas as pd
+
+        all_files = (
+            list(suppl_dir.glob("*.gz")) +
+            list(suppl_dir.glob("*.txt")) +
+            list(suppl_dir.glob("*.tsv")) +
+            list(suppl_dir.glob("*.csv"))
+        )
+        # Excluir archivos de barcodes/features (single-cell)
+        all_files = [
+            f for f in all_files
+            if not any(x in f.name for x in ["barcodes", "features", "matrix.mtx"])
+        ]
+
+        if not all_files:
+            logger.warning(f"[{gse_id}] Sin archivos de counts en {suppl_dir}")
+            return None
+
+        frames = []
+        for fpath in sorted(all_files):
+            try:
+                # Detectar separador y compresión
+                compression = "gzip" if fpath.suffix == ".gz" else None
+                sep = "," if fpath.name.endswith(".csv.gz") or fpath.name.endswith(".csv") else "\t"
+
+                # Leer con header primero para detectar formato
+                df = pd.read_csv(fpath, sep=sep, index_col=0,
+                                  compression=compression, comment="#")
+
+                # Verificar si tiene columnas numéricas (matriz completa)
+                numeric_cols = df.select_dtypes(include="number").columns.tolist()
+                if len(numeric_cols) == 0:
+                    # Intentar sin header
+                    df = pd.read_csv(fpath, sep=sep, index_col=0,
+                                      compression=compression, comment="#", header=None)
+                    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+                if len(numeric_cols) == 0:
+                    logger.warning(f"Sin columnas numéricas en {fpath.name}")
+                    continue
+
+                df = df[numeric_cols]
+
+                # Si es un archivo de muestra única, renombrar columna con GSM o filename
+                if len(numeric_cols) == 1:
+                    gsm_id = self._extract_gsm_from_filename(fpath.stem)
+                    col_name = gsm_id if gsm_id else fpath.stem
+                    df.columns = [col_name]
+
+                # Filtrar líneas de resumen HTSeq
+                df = df[~df.index.astype(str).str.startswith("__")]
+                frames.append(df)
+                logger.debug(f"[{gse_id}] Leído {fpath.name}: {df.shape}")
+
+            except Exception as e:
+                logger.warning(f"Error leyendo {fpath.name}: {e}")
+
+        if not frames:
+            return None
+
+        # Si hay múltiples frames, concatenar por columnas
+        if len(frames) == 1:
+            matrix = frames[0]
         else:
-            return "unclassified"
+            matrix = pd.concat(frames, axis=1)
+
+        matrix.index.name = "gene"
+        # Mantener solo columnas numéricas
+        matrix = matrix.select_dtypes(include="number")
+        return matrix if not matrix.empty else None
+
+    def _extract_gsm_from_filename(self, stem: str) -> str:
+        """Extrae el GSM ID de un nombre de archivo tipo GSM12345_counts."""
+        import re
+        match = re.search(r"(GSM\d+)", stem)
+        return match.group(1) if match else ""
 
     def _extract_platform_info(self, gse) -> dict:
         """
