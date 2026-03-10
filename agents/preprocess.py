@@ -1,4 +1,4 @@
-"""
+﻿"""
 BioSignal Discovery Engine
 Agent 3: PreprocessingAgent
 ============================
@@ -27,16 +27,16 @@ class PreprocessingAgent:
 
     Pipeline por tipo de dato:
         RNA-seq:
-            1. Filtrar genes con expresión baja (< min_counts en < frac_samples)
-            2. Normalización TMM-like via log2(CPM + 1)
-            3. Detección de outliers (IQR sobre PCA componente 1)
+            1. Filtrar genes con expresiÃ³n baja (< min_counts en < frac_samples)
+            2. NormalizaciÃ³n TMM-like via log2(CPM + 1)
+            3. DetecciÃ³n de outliers (IQR sobre PCA componente 1)
             4. Export: matrix_normalized.csv + qc_report.json
 
         Microarray:
-            1. Verificar normalización previa (quantile-normalized en GEO)
+            1. Verificar normalizaciÃ³n previa (quantile-normalized en GEO)
             2. Log2-transform si valores > 100
             3. Filtrar probes de baja varianza (25th percentile)
-            4. Colapsar probes múltiples por gen (mean)
+            4. Colapsar probes mÃºltiples por gen (mean)
             5. Export: matrix_normalized.csv + qc_report.json
 
     Salida por dataset:
@@ -53,6 +53,8 @@ class PreprocessingAgent:
         self.max_outlier_fraction = self.config.get("max_outlier_fraction", 0.20)
         self.low_expr_threshold = self.config.get("low_expression_threshold", 10)
         self.low_expr_fraction = self.config.get("low_expression_fraction", 0.70)
+        self.low_expr_fraction_large = self.config.get("low_expression_fraction_large", 0.20)
+        self.large_dataset_threshold = self.config.get("large_dataset_threshold", 100)
         self.variance_percentile = self.config.get("variance_percentile", 25)
 
     # ------------------------------------------------------------------
@@ -116,30 +118,30 @@ class PreprocessingAgent:
 
         logger.info(f"[{gse_id}] Tipo: {data_type}")
 
-        # Cargar matriz de expresión
+        # Cargar matriz de expresiÃ³n
         matrix = self._load_expression_matrix(dataset_dir)
         if matrix is None or matrix.empty:
-            return self._fail(out_dir, gse_id, "Matriz de expresión vacía o no encontrada")
+            return self._fail(out_dir, gse_id, "Matriz de expresiÃ³n vacÃ­a o no encontrada")
 
         logger.debug(f"[{gse_id}] Dimensiones iniciales: {matrix.shape}")
 
-        # Pipeline según tipo de dato
+        # Pipeline segÃºn tipo de dato
         if data_type == "RNA-seq":
             matrix, qc, counts_raw = self._process_rnaseq(matrix, gse_id)
         else:
             matrix, qc, counts_raw = self._process_microarray(matrix, gse_id)
 
-        # Validar muestras mínimas por grupo
-        sample_meta = self._load_sample_metadata(dataset_dir, matrix_cols=matrix.columns.tolist())
+        # Validar muestras mÃ­nimas por grupo
+        sample_meta = self._load_sample_metadata(dataset_dir, matrix_cols=matrix.columns.tolist(), out_dir=out_dir)
         group_check = self._check_group_balance(sample_meta, gse_id)
         qc.update(group_check)
 
-        # Detección de outliers
+        # DetecciÃ³n de outliers
         matrix, outliers = self._detect_outliers(matrix, gse_id)
         qc["outliers_removed"] = outliers
         qc["outlier_fraction"] = len(outliers) / max(matrix.shape[1] + len(outliers), 1)
 
-        # Validación de genes mínimos
+        # ValidaciÃ³n de genes mÃ­nimos
         qc["genes_final"] = matrix.shape[0]
         qc["samples_final"] = matrix.shape[1]
 
@@ -166,22 +168,34 @@ class PreprocessingAgent:
     # ------------------------------------------------------------------
 
     def _process_rnaseq(self, matrix: pd.DataFrame, gse_id: str) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
-        """Normalización y filtrado para datos de RNA-seq (counts)."""
+        """NormalizaciÃ³n y filtrado para datos de RNA-seq (counts)."""
         qc = {"data_type": "RNA-seq"}
         qc["genes_raw"] = matrix.shape[0]
         qc["samples_raw"] = matrix.shape[1]
 
-        # 1. Filtrar genes de baja expresión
-        min_samples = max(1, int(matrix.shape[1] * self.low_expr_fraction))
-        keep = (matrix >= self.low_expr_threshold).sum(axis=1) >= min_samples
-        matrix = matrix.loc[keep]
+        # 1. Filtrar genes de baja expresiÃ³n
+        p99_val = matrix.stack().quantile(0.99)
+        min_val = matrix.min().min()
+        already_normalized = p99_val < 50 and min_val > -5
+        if already_normalized:
+            variances = matrix.var(axis=1)
+            keep = variances >= variances.quantile(0.1)
+            matrix = matrix.loc[keep]
+            logger.debug(f"[{gse_id}] Datos pre-normalizados, filtro varianza aplicado")
+        else:
+            # Para datasets grandes (>100 muestras) bajar fraccion minima
+            n_samples = matrix.shape[1]
+            effective_fraction = self.low_expr_fraction if n_samples <= self.large_dataset_threshold else self.low_expr_fraction_large
+            min_samples = max(1, int(n_samples * effective_fraction))
+            keep = (matrix >= self.low_expr_threshold).sum(axis=1) >= min_samples
+            matrix = matrix.loc[keep]
         qc["genes_after_lowexpr_filter"] = matrix.shape[0]
-        logger.debug(f"[{gse_id}] Genes tras filtro baja expresión: {matrix.shape[0]}")
+        logger.debug(f"[{gse_id}] Genes tras filtro baja expresiÃ³n: {matrix.shape[0]}")
 
         # Guardar counts filtrados (antes de normalizar) para edgeR
         counts_filtered = matrix.copy()
 
-        # 2. Normalización log2(CPM + 1)
+        # 2. NormalizaciÃ³n log2(CPM + 1)
         col_sums = matrix.sum(axis=0)
         cpm = matrix.div(col_sums, axis=1) * 1e6
         matrix_norm = np.log2(cpm + 1)
@@ -199,7 +213,7 @@ class PreprocessingAgent:
         qc["genes_raw"] = matrix.shape[0]
         qc["samples_raw"] = matrix.shape[1]
 
-        # 1. Log2-transform si no está normalizado
+        # 1. Log2-transform si no estÃ¡ normalizado
         max_val = matrix.max().max()
         if max_val > 100:
             matrix = np.log2(matrix.clip(lower=1))
@@ -214,20 +228,20 @@ class PreprocessingAgent:
         matrix = matrix.loc[variances >= var_threshold]
         qc["probes_after_variance_filter"] = matrix.shape[0]
 
-        # 3. Colapsar probes múltiples por gen (tomar la media)
+        # 3. Colapsar probes mÃºltiples por gen (tomar la media)
         matrix.index = matrix.index.astype(str).str.split("_").str[0]
         matrix = matrix.groupby(matrix.index).mean()
         qc["genes_after_probe_collapse"] = matrix.shape[0]
         qc["normalization"] = "quantile (GEO) + log2 if needed"
 
-        return matrix, qc
+        return matrix, qc, None
 
     # ------------------------------------------------------------------
-    # Detección de outliers (PCA-based IQR)
+    # DetecciÃ³n de outliers (PCA-based IQR)
     # ------------------------------------------------------------------
 
     def _detect_outliers(self, matrix: pd.DataFrame, gse_id: str) -> tuple[pd.DataFrame, list]:
-        """Detecta muestras outliers usando correlación entre muestras."""
+        """Detecta muestras outliers usando correlaciÃ³n entre muestras."""
         if matrix.shape[1] < 4:
             return matrix, []
 
@@ -250,7 +264,7 @@ class PreprocessingAgent:
                 logger.warning(f"[{gse_id}] Demasiados outliers ({len(outlier_samples)}), no se eliminan")
                 return matrix, []
         except Exception as e:
-            logger.warning(f"[{gse_id}] Error en detección de outliers: {e}")
+            logger.warning(f"[{gse_id}] Error en detecciÃ³n de outliers: {e}")
             return matrix, []
 
     # ------------------------------------------------------------------
@@ -258,7 +272,7 @@ class PreprocessingAgent:
     # ------------------------------------------------------------------
 
     def _load_expression_matrix(self, dataset_dir: Path) -> Optional[pd.DataFrame]:
-        """Carga la matriz de expresión desde archivos GEO."""
+        """Carga la matriz de expresiÃ³n desde archivos GEO."""
         candidates = [
             ("matrix_counts.tsv", "\t"),  # Counts suplementarios consolidados (SRA)
             ("matrix.tsv", "\t"),
@@ -291,11 +305,11 @@ class PreprocessingAgent:
     def _parse_geo_series_matrix(self, fpath: Path, sep: str = "\t") -> Optional[pd.DataFrame]:
         """
         Parsea un GEO Series Matrix file con cabeceras que empiezan con '!'.
-        Los datos reales están entre:
+        Los datos reales estÃ¡n entre:
             !series_matrix_table_begin
             ...datos...
             !series_matrix_table_end
-        Si no existe esa sección, el archivo es solo metadata (RNA-seq SRA)
+        Si no existe esa secciÃ³n, el archivo es solo metadata (RNA-seq SRA)
         y retorna None.
         """
         in_table = False
@@ -313,21 +327,21 @@ class PreprocessingAgent:
                     lines.append(line_stripped)
 
         if not lines:
-            logger.warning(f"[preprocess] {fpath.name}: sin tabla de expresión (posiblemente RNA-seq SRA sin counts en series matrix)")
+            logger.warning(f"[preprocess] {fpath.name}: sin tabla de expresiÃ³n (posiblemente RNA-seq SRA sin counts en series matrix)")
             return None
 
         from io import StringIO
         content = "\n".join(lines)
         df = pd.read_csv(StringIO(content), sep=sep, index_col=0)
 
-        # Limpiar nombre del índice (suele ser "ID_REF")
+        # Limpiar nombre del Ã­ndice (suele ser "ID_REF")
         df.index.name = "gene"
-        logger.debug(f"[preprocess] GEO matrix parseado: {df.shape[0]} genes × {df.shape[1]} muestras")
+        logger.debug(f"[preprocess] GEO matrix parseado: {df.shape[0]} genes Ã— {df.shape[1]} muestras")
         return df
 
 
     def _load_metadata(self, dataset_dir: Path) -> dict:
-        """Carga metadata del dataset e infiere data_type si no está explícito."""
+        """Carga metadata del dataset e infiere data_type si no estÃ¡ explÃ­cito."""
         meta_path = dataset_dir / "metadata.json"
         if not meta_path.exists():
             return {}
@@ -349,15 +363,20 @@ class PreprocessingAgent:
 
         return meta
 
-    def _load_sample_metadata(self, dataset_dir: Path, matrix_cols: list = None) -> Optional[pd.DataFrame]:
+    def _load_sample_metadata(self, dataset_dir: Path, matrix_cols: list = None, out_dir: Path = None) -> Optional[pd.DataFrame]:
         """
-        Carga metadata de muestras. Intenta alinear el índice con las columnas
-        de la matriz (que pueden ser títulos en lugar de GSM IDs).
+        Carga metadata de muestras. Intenta alinear el Ã­ndice con las columnas
+        de la matriz (que pueden ser tÃ­tulos en lugar de GSM IDs).
         """
+        search_dirs = [d for d in [out_dir, dataset_dir] if d is not None]
         for fname in ["sample_metadata.csv", "samples.csv", "phenodata.csv"]:
-            fpath = dataset_dir / fname
-            if fpath.exists():
-                return pd.read_csv(fpath, index_col=0)
+            for search_dir in search_dirs:
+                fpath = search_dir / fname
+                if fpath.exists():
+                    df_cached = pd.read_csv(fpath, index_col=0)
+                    if matrix_cols is None or df_cached.index.isin(matrix_cols).any():
+                        return df_cached
+                    import os; os.remove(fpath)
 
         meta_path = dataset_dir / "metadata.json"
         if not meta_path.exists():
@@ -375,15 +394,20 @@ class PreprocessingAgent:
             rows.append({
                 "gsm_id": s.get("gsm_id", ""),
                 "title": s.get("title", ""),
+                "description": s.get("characteristics", {}).get("description", ""),
                 "group": s.get("label", "unclassified"),
             })
         df = pd.DataFrame(rows)
 
         if matrix_cols:
+            # Caso 0: description (ej. WC1, KC1)
+            df["desc_clean"] = df["description"].str.strip()
+            if df["desc_clean"].isin(matrix_cols).any():
+                return df.set_index("desc_clean")[["group"]]
             # Caso 1: columnas son GSM IDs
             if df["gsm_id"].isin(matrix_cols).any():
                 return df.set_index("gsm_id")[["group"]]
-            # Caso 2: columnas son títulos — limpiar prefijos tipo "A2712: "
+            # Caso 2: columnas son tÃ­tulos â€” limpiar prefijos tipo "A2712: "
             df["title_clean"] = df["title"].str.split(": ").str[-1].str.strip()
             if df["title_clean"].isin(matrix_cols).any():
                 return df.set_index("title_clean")[["group"]]
@@ -397,8 +421,252 @@ class PreprocessingAgent:
                         break
             if title_map:
                 return pd.DataFrame({"group": title_map})
+            # Caso 4: Capa 2 LLM
+            logger.info(f"Intentando Capa 2 (LLM) para {dataset_dir.name}...")
+            llm_map = self._llm_map_columns(matrix_cols, all_samples, gse_id=dataset_dir.name)
+            llm_groups = set(llm_map.values()) if llm_map else set()
+            llm_valid = llm_map and len(llm_groups) >= 2
+            if llm_valid:
+                result_df = pd.DataFrame({"group": llm_map})
+                result_df.to_csv(dataset_dir / "sample_metadata.csv")
+                logger.success(f"Capa 2 LLM: {len(llm_map)} columnas mapeadas")
+                return result_df
+            # Caso 5: Capa 3 SRA RunInfo
+            logger.info(f"Capa 2 inválida (grupos={llm_groups}), intentando Capa 3 (SRA)...")
+            sra_map = self._sra_map_columns(matrix_cols, all_samples, gse_id=dataset_dir.name)
+            if sra_map and len(set(sra_map.values())) >= 2:
+                result_df = pd.DataFrame({"group": sra_map})
+                result_df.to_csv(dataset_dir / "sample_metadata.csv")
+                logger.success(f"Capa 3 SRA: {len(sra_map)} columnas mapeadas")
+                return result_df
 
         return df.set_index("gsm_id")[["group"]]
+
+
+    def _llm_map_columns(self, matrix_cols: list, all_samples: list, gse_id: str) -> dict:
+        """
+        Capa 2: Usa Ollama para inferir mapeo columnas -> grupo cuando los casos
+        determinísticos fallan.
+
+        Args:
+            matrix_cols: Columnas de la matriz (ej. ['GQ01_S46', 'GQ02_S68', ...])
+            all_samples: Lista de dicts con gsm_id, title, label de metadata.json
+            gse_id: ID del dataset para logging
+
+        Returns:
+            dict {columna: 'case'|'control'} o {} si falla
+        """
+        try:
+            import requests as _requests
+            import json as _json
+
+            # Preparar contexto para el LLM
+            sample_info = []
+            for s in all_samples[:30]:  # Limitar contexto
+                sample_info.append({
+                    "title": s.get("title", ""),
+                    "label": s.get("label", "unclassified"),
+                })
+
+            cols_preview = matrix_cols[:30]
+
+            prompt = f"""You are a bioinformatics expert. Map matrix column names to sample groups.
+
+Matrix columns (first {len(cols_preview)}): {cols_preview}
+
+Sample metadata:
+{_json.dumps(sample_info, indent=2)}
+
+Task: For each matrix column, determine if it belongs to 'case' or 'control' group.
+Use the sample titles, GSM IDs, and labels to infer the mapping.
+Look for patterns: control=WT/normal/ctrl/vehicle, case=KO/treated/disease/AD/mut.
+
+Respond ONLY with a JSON object mapping column names to groups. Example:
+{{"GQ01_S46": "control", "GQ02_S68": "case"}}
+
+Include ALL {len(matrix_cols)} columns. No explanation, just JSON."""
+
+            payload = {
+                "model": "gemma3:4b",
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.1}
+            }
+            resp = _requests.post(
+                "http://localhost:11434/api/generate",
+                json=payload,
+                timeout=60
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[{gse_id}] Ollama error: {resp.status_code}")
+                return {}
+
+            text = resp.json().get("response", "").strip()
+
+            # Extraer JSON de la respuesta
+            import re as _re
+            json_match = _re.search(r'\{[^{}]+\}', text, _re.DOTALL)
+            if not json_match:
+                logger.warning(f"[{gse_id}] LLM no retornó JSON válido")
+                return {}
+
+            mapping = _json.loads(json_match.group())
+
+            # Validar que los valores sean case/control
+            valid = {k: v for k, v in mapping.items()
+                     if v in ("case", "control") and k in matrix_cols}
+
+            logger.info(f"[{gse_id}] Capa 2 LLM mapeó {len(valid)}/{len(matrix_cols)} columnas")
+            return valid
+
+        except Exception as e:
+            logger.warning(f"[{gse_id}] Capa 2 LLM falló: {e}")
+            return {}
+
+
+    def _sra_map_columns(self, matrix_cols: list, all_samples: list, gse_id: str) -> dict:
+        """
+        Capa 3: Busca tabla SRA RunInfo en NCBI para obtener mapeo
+        Run/SampleName -> GSM -> label cuando Capa 2 LLM falla.
+
+        Flujo:
+            1. esearch SRA para obtener IDs de runs del GSE
+            2. efetch RunInfo CSV con SampleName, BioSample, Run
+            3. Cruzar SampleName/Run con columnas de la matriz
+            4. Mapear GSM -> label desde all_samples
+
+        Returns:
+            dict {columna: 'case'|'control'} o {} si falla
+        """
+        try:
+            import requests as _requests
+            import csv as _csv
+            import io as _io
+
+            base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+            email = self.config.get("ncbi_email", "biosignal@research.com")
+
+            # Paso 1: esearch SRA para el GSE
+            logger.info(f"[{gse_id}] Capa 3: consultando SRA RunInfo...")
+            # Paso 1a: obtener UID interno de GEO para el GSE
+            geo_url = (
+                f"{base}/esearch.fcgi?db=gds&term={gse_id}[Accession]"
+                f"&retmax=5&retmode=json&email={email}"
+            )
+            r0 = _requests.get(geo_url, timeout=15)
+            geo_ids = r0.json().get("esearchresult", {}).get("idlist", [])
+            if not geo_ids:
+                logger.warning(f"[{gse_id}] Capa 3: GSE no encontrado en GEO")
+                return {}
+
+            # Paso 1b: elink GEO -> SRA para obtener SRA IDs
+            elink_url = (
+                f"{base}/elink.fcgi?dbfrom=gds&db=sra&id={geo_ids[0]}"
+                f"&retmode=json&email={email}"
+            )
+            r1 = _requests.get(elink_url, timeout=15)
+            linksets = r1.json().get("linksets", [])
+            ids = []
+            for ls in linksets:
+                for ld in ls.get("linksetdbs", []):
+                    if ld.get("dbto") == "sra":
+                        ids.extend(ld.get("links", []))
+            if not ids:
+                logger.warning(f"[{gse_id}] Capa 3: no se encontraron runs en SRA via elink")
+                return {}
+            search_url = f"{base}/esearch.fcgi?db=sra&term={gse_id}"  # unused now
+            logger.info(f"[{gse_id}] Capa 3: {len(ids)} runs SRA encontrados via elink")
+
+            # Paso 2: efetch RunInfo CSV
+            fetch_url = (
+                f"{base}/efetch.fcgi?db=sra&id={','.join(ids[:200])}"
+                f"&rettype=runinfo&retmode=text&email={email}"
+            )
+            r2 = _requests.get(fetch_url, timeout=30)
+            if r2.status_code != 200 or not r2.text.strip():
+                logger.warning(f"[{gse_id}] Capa 3: efetch RunInfo vacío")
+                return {}
+
+            # Paso 3: parsear CSV y construir lookup
+            reader = _csv.DictReader(_io.StringIO(r2.text))
+            rows = list(reader)
+            if not rows:
+                return {}
+
+            # Construir GSM -> label desde all_samples
+            gsm_to_label = {
+                s.get("gsm_id", ""): s.get("label", "unclassified")
+                for s in all_samples
+            }
+
+            # Construir BioSample -> label via GSM
+            biosample_to_label = {}
+            for row in rows:
+                gsm = row.get("SampleName", "")
+                bs = row.get("BioSample", "")
+                if gsm and bs and gsm in gsm_to_label:
+                    biosample_to_label[bs] = gsm_to_label[gsm]
+
+            # Paso 3b: consultar BioSample para obtener nombre de muestra del lab
+            # BioSample title suele coincidir con columnas de la matriz
+            biosample_to_colname = {}
+            unique_biosamples = list({row.get("BioSample","") for row in rows if row.get("BioSample","")})
+            for bs_id in unique_biosamples[:100]:
+                try:
+                    bs_resp = _requests.get(
+                        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                        f"?db=biosample&id={bs_id}&retmode=text",
+                        timeout=10
+                    )
+                    # Primera línea contiene el nombre: "1: Males-5xFAD_4"
+                    first_line = bs_resp.text.strip().split("\n")[0]
+                    if ": " in first_line:
+                        col_name = first_line.split(": ", 1)[1].strip()
+                        biosample_to_colname[bs_id] = col_name
+                except Exception:
+                    continue
+
+            # Cruzar col_name -> label
+            mapping = {}
+            for bs_id, col_name in biosample_to_colname.items():
+                label = biosample_to_label.get(bs_id, "")
+                if label in ("case", "control"):
+                    # Match exacto o parcial con matrix_cols
+                    for col in matrix_cols:
+                        if col == col_name or col in col_name or col_name in col:
+                            mapping[col] = label
+                            break
+
+            # Fallback: cruzar campos candidatos directamente
+            if not mapping:
+                candidate_fields = ["SampleName", "Run", "Sample", "LibraryName", "Experiment"]
+                for col in matrix_cols:
+                    col_lower = col.lower()
+                    for row in rows:
+                        matched = False
+                        for field in candidate_fields:
+                            val = row.get(field, "").strip()
+                            if val and (val == col or val.lower() == col_lower
+                                        or col in val or val in col):
+                                gsm = row.get("SampleName", "") or row.get("Sample", "")
+                                label = gsm_to_label.get(gsm, "")
+                                if label in ("case", "control"):
+                                    mapping[col] = label
+                                    matched = True
+                                    break
+                        if matched:
+                            break
+
+            groups = set(mapping.values())
+            logger.info(
+                f"[{gse_id}] Capa 3 SRA mapeó {len(mapping)}/{len(matrix_cols)} columnas "
+                f"| grupos: {groups}"
+            )
+            return mapping
+
+        except Exception as e:
+            logger.warning(f"[{gse_id}] Capa 3 SRA falló: {e}")
+            return {}
 
     def _check_group_balance(self, sample_meta: Optional[pd.DataFrame], gse_id: str) -> dict:
         """Verifica que haya suficientes muestras por grupo."""
@@ -451,8 +719,8 @@ class PreprocessingAgent:
 @click.command()
 @click.option("--input", "raw_dir", required=True, help="Directorio con datasets crudos (data/raw/)")
 @click.option("--output", "output_dir", default="data/processed/", help="Directorio de salida")
-@click.option("--min-genes", default=5000, help="Mínimo genes detectados para PASS")
-@click.option("--min-samples", default=3, help="Mínimo muestras por grupo")
+@click.option("--min-genes", default=5000, help="MÃ­nimo genes detectados para PASS")
+@click.option("--min-samples", default=3, help="MÃ­nimo muestras por grupo")
 def main(raw_dir, output_dir, min_genes, min_samples):
     """Agent 3: Preprocesa y realiza QC de datasets GEO."""
     config = {

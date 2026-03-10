@@ -54,6 +54,7 @@ class DatasetDownloadAgent:
         "control", "normal", "healthy", "non-tumor", "adjacent",
         "wild type", "wt", "vehicle", "untreated", "mock",
         "_c_", " ckp", "ckp_", "wildtype", "parental", "scramble",
+        "ctr", "ctrl", "non-ad", "non_ad", "no infection",
         "empty vector", "gfp", "lacz", "dmso", "sictl", "shctl"
     ]
 
@@ -62,6 +63,7 @@ class DatasetDownloadAgent:
         "tumor", "cancer", "disease", "patient", "treated",
         "knockdown", "knockout", "kd", "ko", "mutant", "overexpression",
         "cckp", "gckp", "sirna", "shrna", "lnd", "sr4", "inhibitor",
+        "alzheimer", " ad ", "ad_", "_ad", "mci", "dementia", "infected",
         "drug", "stimulated", "infected", "transfected", "overexpr"
     ]
 

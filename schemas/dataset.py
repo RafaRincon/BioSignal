@@ -23,6 +23,7 @@ class DatasetMetadata(BaseModel):
     data_type: str = Field(default="unknown", description="'RNA-seq' | 'microarray'")
     summary: str = Field(default="", description="Resumen del estudio")
     rank_score: float = Field(default=0.0, description="Score de ranking (0-1)")
+    downloadability_score: int = Field(default=1, description="Score de descargabilidad (0-3)")
 
     @field_validator("gse_id")
     @classmethod

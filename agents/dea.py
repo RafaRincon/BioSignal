@@ -412,8 +412,8 @@ class DifferentialExpressionAgent:
         """Selecciona el método DEA. edgeR es el default para ambos tipos de dato."""
         if self.prefer_method != "auto":
             return self.prefer_method
-        # edgeR funciona bien tanto para RNA-seq como microarray
-        return "edger"
+        # edgeR para RNA-seq, limma para microarray
+        return "edger" if data_type == "RNA-seq" else "limma"
 
     def _order_groups(self, groups: list) -> list:
         """Ordena grupos: case primero, control segundo."""

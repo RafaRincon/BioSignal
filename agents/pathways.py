@@ -94,6 +94,8 @@ class PathwayEnrichmentAgent:
             return {"error": "gseapy_not_available"}
 
         disease_dirs = sorted([d for d in meta_path.iterdir() if d.is_dir()])
+        if self.config.get("disease_filter"):
+            disease_dirs = [d for d in disease_dirs if d.name == self.config["disease_filter"]]
         logger.info(f"[PathwayAgent] Encontrados {len(disease_dirs)} resultados de meta-análisis")
 
         for disease_dir in disease_dirs:
@@ -270,9 +272,10 @@ class PathwayEnrichmentAgent:
 @click.option("--output", "output_dir", default="data/pathways/", help="Directorio de salida")
 @click.option("--padj", default=0.05, help="Umbral FDR para filtrado")
 @click.option("--top-n", default=20, help="Top N pathways a reportar")
-def main(meta_dir, output_dir, padj, top_n):
+@click.option("--disease", default=None, help="Filtrar por enfermedad especifica (ej. alzheimer)")
+def main(meta_dir, output_dir, padj, top_n, disease):
     """Agent 6: Enriquecimiento de pathways (KEGG, GO, Reactome, Hallmarks)."""
-    config = {"padj_threshold": padj, "top_n_pathways": top_n}
+    config = {"padj_threshold": padj, "top_n_pathways": top_n, "disease_filter": disease}
     agent = PathwayEnrichmentAgent(config=config)
     summary = agent.run(meta_dir, output_dir)
     click.echo(json.dumps(summary, indent=2, default=str))

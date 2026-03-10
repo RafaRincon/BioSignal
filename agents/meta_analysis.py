@@ -219,8 +219,8 @@ class MetaAnalysisAgent:
             log2fc_dict[gse_id] = gene_df["log2FC"].reindex(all_genes)
             pvalue_dict[gse_id] = gene_df["pvalue"].reindex(all_genes)
 
-        log2fc_matrix = pd.DataFrame(log2fc_dict, index=sorted(all_genes))
-        pvalue_matrix = pd.DataFrame(pvalue_dict, index=sorted(all_genes))
+        log2fc_matrix = pd.DataFrame(log2fc_dict, index=sorted(str(g) for g in all_genes))
+        pvalue_matrix = pd.DataFrame(pvalue_dict, index=sorted(str(g) for g in all_genes))
 
         return log2fc_matrix, pvalue_matrix
 

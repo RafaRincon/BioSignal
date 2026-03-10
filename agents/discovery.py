@@ -17,6 +17,7 @@ Uso:
 """
 
 import json
+import requests
 import time
 import click
 from pathlib import Path
@@ -132,6 +133,12 @@ class DatasetDiscoveryAgent:
 
         logger.info(f"Datasets válidos después de filtros: {len(datasets)}")
 
+        # Paso 3b: Capa 1 scoring de descargabilidad
+        logger.info("Verificando descargabilidad de datasets...")
+        for d in datasets:
+            d.downloadability_score = self._check_downloadability(d.gse_id)
+            logger.debug(f"  [{d.gse_id}] Downloadability score: {d.downloadability_score}")
+
         # Paso 4: Rankear y limitar
         ranked = self._rank_datasets(datasets)
         final = ranked[:max_datasets]
@@ -174,7 +181,7 @@ class DatasetDiscoveryAgent:
             return None
 
         # Extraer número de muestras
-        sample_count = int(raw_meta.get("n_samples", 0))
+        sample_count = int(raw_meta.get("n_samples", 0) or 0)
         if sample_count < min_samples:
             return None
 
@@ -194,6 +201,38 @@ class DatasetDiscoveryAgent:
             summary=raw_meta.get("summary", "")[:500],
         )
         return dataset
+
+
+    def _check_downloadability(self, gse_id: str) -> int:
+        """
+        Capa 1: Scoring de descargabilidad consultando supplementary files de GEO.
+        Scores: 3=counts consolidados, 2=RAW.tar, 1=solo series matrix, 0=sin archivos
+        """
+        try:
+            gse_num = int(gse_id.replace("GSE", ""))
+            prefix = str(gse_num)[:-3] if gse_num >= 1000 else "0"
+            ftp_url = (
+                f"https://ftp.ncbi.nlm.nih.gov/geo/series/GSE{prefix}nnn"
+                f"/{gse_id}/suppl/"
+            )
+            resp = requests.get(ftp_url, timeout=10)
+            if resp.status_code != 200:
+                return 1
+            body = resp.text.lower()
+            count_keywords = [
+                "count", "counts", "rawcounts", "raw_count", "genecounts",
+                "featurecounts", "starcounts", "count_matrix", "readcounts",
+            ]
+            has_counts = any(kw in body for kw in count_keywords)
+            has_tabular = ".csv" in body or ".tsv" in body or ".txt" in body
+            if has_counts and has_tabular:
+                return 3
+            if "_raw.tar" in body:
+                return 2
+            return 1
+        except Exception as e:
+            logger.debug(f"[{gse_id}] _check_downloadability error: {e}")
+            return 1
 
     def _rank_datasets(self, datasets: list[DatasetMetadata]) -> list[DatasetMetadata]:
         """
@@ -220,10 +259,12 @@ class DatasetDiscoveryAgent:
             # PMIDs como proxy de citaciones: datasets con PMID tienen +0.5
             citation_score = 1.0 if dataset.pmid else 0.5
 
+            dl_score = getattr(dataset, 'downloadability_score', 1) / 3.0
             dataset.rank_score = (
-                0.4 * citation_score +
-                0.4 * sample_score +
-                0.2 * year_score
+                0.35 * citation_score +
+                0.35 * sample_score +
+                0.15 * year_score +
+                0.15 * dl_score
             )
 
         return sorted(datasets, key=lambda d: d.rank_score, reverse=True)

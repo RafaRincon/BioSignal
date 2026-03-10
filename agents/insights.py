@@ -180,6 +180,8 @@ class InsightGenerationAgent:
         start = time.time()
 
         disease_dirs = sorted([d for d in pathways_path.iterdir() if d.is_dir()])
+        if self.config.get("disease_filter"):
+            disease_dirs = [d for d in disease_dirs if d.name == self.config["disease_filter"]]
         logger.info(f"[InsightAgent] Procesando {len(disease_dirs)} enfermedades")
 
         for disease_dir in disease_dirs:
@@ -617,9 +619,10 @@ with this exact structure (no markdown, no backticks):
 @click.option("--meta", "meta_dir", required=True, help="Directorio meta-análisis (data/meta/)")
 @click.option("--output", "output_dir", default="data/insights/", help="Directorio de salida")
 @click.option("--top-genes", default=20, help="Número de genes top para contexto LLM")
-def main(pathways_dir, meta_dir, output_dir, top_genes):
+@click.option("--disease", default=None, help="Filtrar por enfermedad especifica")
+def main(pathways_dir, meta_dir, output_dir, top_genes, disease):
     """Agent 7: Generación de insights biológicos con Claude API."""
-    config = {"top_genes_for_context": top_genes}
+    config = {"top_genes_for_context": top_genes, "disease_filter": disease}
     agent = InsightGenerationAgent(config=config)
     summary = agent.run(pathways_dir, meta_dir, output_dir)
     click.echo(json.dumps(summary, indent=2))

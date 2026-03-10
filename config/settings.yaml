@@ -56,6 +56,8 @@ preprocessing:
   max_outlier_fraction: 0.20    # Máximo fracción de outliers (20%)
   low_expression_threshold: 10  # counts mínimos
   low_expression_fraction: 0.70 # en qué fracción de muestras
+  low_expression_fraction_large: 0.20  # fracción para datasets > large_dataset_threshold muestras
+  large_dataset_threshold: 100  # umbral para considerar dataset grande
 
   # Normalización
   rnaseq_normalization: "TMM"           # TMM | TPM | CPM
@@ -85,7 +87,7 @@ dea:
 # --- Agent 5: MetaAnalysis ---
 meta_analysis:
   method: "fisher"              # fisher | stouffer | vote_counting | REM
-  min_dataset_fraction: 0.60    # Gen presente en ≥60% de datasets
+  min_dataset_fraction: 0.40    # Gen presente en ≥60% de datasets
   direction_threshold: 0.70     # UP si mean(log2FC) > 0 en ≥70% datasets
   padj_threshold: 0.05
   generate_heatmap: true
