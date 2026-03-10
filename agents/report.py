@@ -190,7 +190,7 @@ class ReportGenerationAgent:
         dea_path = data_path / "dea"
         if dea_path.exists():
             dea_dirs = [d for d in dea_path.iterdir() if d.is_dir()]
-            metrics["datasets_analyzed"] = len(dea_dirs)
+            metrics["datasets_analyzed"] = len([d for d in dea_dirs if (d / "dea_results.csv").exists()])
             # Sumar muestras totales
             total_sig = 0
             for d in dea_dirs:
@@ -200,14 +200,17 @@ class ReportGenerationAgent:
                     total_sig += s.get("n_significant", 0)
             metrics["total_significant_genes_sum"] = total_sig
 
-        # Total muestras desde discovery
-        disc_path = data_path / "discovery"
-        if disc_path.exists():
-            for f in disc_path.glob("*.json"):
-                disc_data = self._load_json_safe(f) or {}
-                datasets = disc_data.get("datasets", [])
-                metrics["total_samples"] = sum(d.get("sample_count", 0) for d in datasets)
-                break
+        # Total muestras desde processed
+        proc_path = data_path / "processed"
+        if proc_path.exists():
+            total = 0
+            for d in proc_path.iterdir():
+                qc_f = d / "qc_report.json"
+                if qc_f.exists():
+                    qc = self._load_json_safe(qc_f) or {}
+                    if qc.get("status") == "PASS":
+                        total += qc.get("samples_final", 0)
+            metrics["total_samples"] = total
 
         return metrics
 

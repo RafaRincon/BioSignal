@@ -20,6 +20,8 @@ import pandas as pd
 from loguru import logger
 from scipy import stats
 
+from utils.audit import AuditWriter
+
 
 class PreprocessingAgent:
     """
@@ -46,7 +48,7 @@ class PreprocessingAgent:
         data/processed/{gse_id}/qc_status.txt   # PASS | FAIL
     """
 
-    def __init__(self, config: dict = None):
+    def __init__(self, config: dict = None, run_id: str = None, run_dir: str = None):
         self.config = config or {}
         self.min_samples_per_group = self.config.get("min_samples_per_group", 3)
         self.min_genes_detected = self.config.get("min_genes_detected", 5000)
@@ -56,6 +58,11 @@ class PreprocessingAgent:
         self.low_expr_fraction_large = self.config.get("low_expression_fraction_large", 0.20)
         self.large_dataset_threshold = self.config.get("large_dataset_threshold", 100)
         self.variance_percentile = self.config.get("variance_percentile", 25)
+
+        # Audit trail
+        self.run_id = run_id or "local"
+        self.run_dir = Path(run_dir) if run_dir else Path("data/runs") / self.run_id
+        self._audit: Optional[AuditWriter] = None
 
     # ------------------------------------------------------------------
     # Entrada principal
@@ -79,6 +86,16 @@ class PreprocessingAgent:
         summary = {"processed": [], "failed": [], "skipped": []}
         start = time.time()
 
+        # Inicializar audit trail
+        self._audit = AuditWriter(
+            agent_id="03_preprocess",
+            agent_name="PreprocessingAgent",
+            run_id=self.run_id,
+            run_dir=self.run_dir,
+            config_snapshot=self.config,
+            data_type="transcriptomics",
+        )
+
         dataset_dirs = sorted([d for d in raw_path.iterdir() if d.is_dir()])
         logger.info(f"[PreprocessingAgent] Encontrados {len(dataset_dirs)} datasets en {raw_dir}")
 
@@ -101,6 +118,11 @@ class PreprocessingAgent:
             f"SKIP={len(summary['skipped'])} | "
             f"FAIL={len(summary['failed'])}"
         )
+
+        # Guardar audit trail
+        if self._audit:
+            self._audit.save()
+
         return summary
 
     # ------------------------------------------------------------------
@@ -200,6 +222,13 @@ class PreprocessingAgent:
         cpm = matrix.div(col_sums, axis=1) * 1e6
         matrix_norm = np.log2(cpm + 1)
         qc["normalization"] = "log2(CPM+1)"
+        if self._audit:
+            self._audit.add_decision(
+                subject=gse_id,
+                decision="log2(CPM+1)",
+                reason="RNA-seq counts: normalización log2(CPM+1) aplicada",
+                evidence={"already_normalized": {"observed": already_normalized, "threshold": None, "pass": True}},
+            )
 
         return matrix_norm, qc, counts_filtered
 
@@ -374,7 +403,9 @@ class PreprocessingAgent:
                 fpath = search_dir / fname
                 if fpath.exists():
                     df_cached = pd.read_csv(fpath, index_col=0)
-                    if matrix_cols is None or df_cached.index.isin(matrix_cols).any():
+                    has_cols = matrix_cols is None or df_cached.index.isin(matrix_cols).any()
+                    has_groups = "group" in df_cached.columns and len(df_cached["group"].unique()) >= 2
+                    if has_cols and has_groups:
                         return df_cached
                     import os; os.remove(fpath)
 
@@ -669,36 +700,132 @@ Include ALL {len(matrix_cols)} columns. No explanation, just JSON."""
             return {}
 
     def _check_group_balance(self, sample_meta: Optional[pd.DataFrame], gse_id: str) -> dict:
-        """Verifica que haya suficientes muestras por grupo."""
+        """
+        Verifica que haya suficientes muestras por grupo.
+        Requiere presencia explícita de ambos grupos 'case' y 'control'.
+        Muestras 'unclassified' se reportan como advertencia pero no cuentan como grupo válido.
+        """
         if sample_meta is None or "group" not in sample_meta.columns:
             return {"group_check": "skipped_no_metadata"}
 
-        counts = sample_meta["group"].value_counts()
-        min_group = counts.min()
+        counts = sample_meta["group"].value_counts().to_dict()
+
+        n_case = counts.get("case", 0)
+        n_control = counts.get("control", 0)
+        n_unclassified = counts.get("unclassified", 0)
+
+        # Ambos grupos deben existir con el mínimo requerido
+        both_groups_present = n_case >= self.min_samples_per_group and n_control >= self.min_samples_per_group
+        min_group = min(n_case, n_control)
+
         result = {
-            "group_counts": counts.to_dict(),
+            "group_counts": counts,
             "min_group_samples": int(min_group),
-            "group_balance_ok": bool(min_group >= self.min_samples_per_group),
+            "group_balance_ok": both_groups_present,
         }
-        if not result["group_balance_ok"]:
-            logger.warning(f"[{gse_id}] Grupo con < {self.min_samples_per_group} muestras: {counts.to_dict()}")
+
+        if not both_groups_present:
+            logger.warning(
+                f"[{gse_id}] Grupos insuficientes — case={n_case}, control={n_control} "
+                f"(mínimo={self.min_samples_per_group}): {counts}"
+            )
+        if n_unclassified > 0:
+            logger.warning(
+                f"[{gse_id}] {n_unclassified} muestras sin clasificar (unclassified) — "
+                f"no se incluyen en el balance de grupos"
+            )
+
         return result
 
     def _compute_qc_status(self, qc: dict, gse_id: str) -> str:
-        """Determina si el dataset pasa o falla el QC."""
-        reasons = []
+        """
+        Determina si el dataset pasa o falla el QC.
+        Genera scorecard estructurada y la registra en el audit trail.
+        """
+        fail_reasons = []
+        warn_reasons = []
 
-        if qc.get("genes_final", 0) < self.min_genes_detected:
-            reasons.append(f"genes_final={qc.get('genes_final')} < {self.min_genes_detected}")
+        # --- Métrica 1: genes detectados ---
+        genes_final = qc.get("genes_final", 0)
+        genes_pass = genes_final >= self.min_genes_detected
+        if not genes_pass:
+            fail_reasons.append(f"genes_final={genes_final} < {self.min_genes_detected}")
+        elif genes_final < self.min_genes_detected * 1.1:
+            warn_reasons.append(f"genes_final={genes_final} cerca del umbral mínimo ({self.min_genes_detected})")
 
-        if not qc.get("group_balance_ok", True):
-            reasons.append("grupo desbalanceado")
+        # --- Métrica 2: balance de grupos ---
+        group_ok = qc.get("group_balance_ok", True)
+        group_counts = qc.get("group_counts", {})
+        counts_list = list(group_counts.values()) if group_counts else []
+        if len(counts_list) >= 2:
+            ratio = max(counts_list) / max(min(counts_list), 1)
+        else:
+            ratio = None
+        if not group_ok:
+            fail_reasons.append("grupo desbalanceado")
+        elif ratio and ratio > 3.0:
+            warn_reasons.append(f"balance caso/control ratio={ratio:.1f} (umbral recomendado ≤5:1)")
 
-        if qc.get("outlier_fraction", 0) > self.max_outlier_fraction:
-            reasons.append(f"outlier_fraction={qc.get('outlier_fraction'):.2f} > {self.max_outlier_fraction}")
+        # --- Métrica 3: fracción de outliers ---
+        outlier_frac = qc.get("outlier_fraction", 0)
+        outlier_pass = outlier_frac <= self.max_outlier_fraction
+        if not outlier_pass:
+            fail_reasons.append(f"outlier_fraction={outlier_frac:.2f} > {self.max_outlier_fraction}")
+        elif outlier_frac > self.max_outlier_fraction * 0.75:
+            warn_reasons.append(f"outlier_fraction={outlier_frac:.2f} cerca del umbral ({self.max_outlier_fraction})")
 
-        if reasons:
-            logger.warning(f"[{gse_id}] QC FAIL: {'; '.join(reasons)}")
+        # --- Métrica 4: correlación entre réplicas (si disponible) ---
+        replicate_corr = qc.get("mean_replicate_correlation")
+        corr_pass = True
+        if replicate_corr is not None:
+            corr_pass = replicate_corr >= 0.85
+            if not corr_pass:
+                fail_reasons.append(f"correlación entre réplicas={replicate_corr:.3f} < 0.85")
+            elif replicate_corr < 0.90:
+                warn_reasons.append(f"correlación entre réplicas={replicate_corr:.3f} borderline (recomendado >0.90)")
+
+        # --- Construir scorecard estructurada ---
+        scorecard = {
+            "genes_detected": AuditWriter.metric(
+                genes_final, self.min_genes_detected, genes_pass
+            ),
+            "group_balance_ok": AuditWriter.metric(
+                group_ok, True, group_ok
+            ),
+            "outlier_fraction": AuditWriter.metric(
+                round(outlier_frac, 4), self.max_outlier_fraction, outlier_pass
+            ),
+        }
+        if ratio is not None:
+            scorecard["case_control_ratio"] = AuditWriter.metric(
+                round(ratio, 2), 5.0, ratio <= 5.0
+            )
+        if replicate_corr is not None:
+            scorecard["replicate_correlation"] = AuditWriter.metric(
+                round(replicate_corr, 4), 0.85, corr_pass
+            )
+        if group_counts:
+            scorecard["group_counts"] = {"observed": group_counts, "threshold": None, "pass": group_ok}
+
+        # --- Registrar en audit trail ---
+        if self._audit:
+            status_str = "FAIL" if fail_reasons else "PASS"
+            reason_str = (
+                "Criterios fallidos: " + "; ".join(fail_reasons)
+                if fail_reasons
+                else "Todos los criterios de calidad superados"
+            )
+            self._audit.add_decision(
+                subject=gse_id,
+                decision=status_str,
+                reason=reason_str,
+                evidence=scorecard,
+            )
+            for w in warn_reasons:
+                self._audit.add_warning(w, subject=gse_id)
+
+        if fail_reasons:
+            logger.warning(f"[{gse_id}] QC FAIL: {'; '.join(fail_reasons)}")
             return "FAIL"
         return "PASS"
 
@@ -709,6 +836,12 @@ Include ALL {len(matrix_cols)} columns. No explanation, just JSON."""
         with open(out_dir / "qc_report.json", "w") as f:
             json.dump(qc, f, indent=2)
         (out_dir / "qc_status.txt").write_text("FAIL")
+        if self._audit:
+            self._audit.add_decision(
+                subject=gse_id,
+                decision="FAIL",
+                reason=reason,
+            )
         return {"status": "FAIL", "qc": qc}
 
 
@@ -721,13 +854,33 @@ Include ALL {len(matrix_cols)} columns. No explanation, just JSON."""
 @click.option("--output", "output_dir", default="data/processed/", help="Directorio de salida")
 @click.option("--min-genes", default=5000, help="MÃ­nimo genes detectados para PASS")
 @click.option("--min-samples", default=3, help="MÃ­nimo muestras por grupo")
-def main(raw_dir, output_dir, min_genes, min_samples):
+@click.option("--run-id", "run_id", default=None, help="ID del run para audit trail")
+@click.option("--run-dir", "run_dir", default=None, help="Directorio raíz del run (data/runs/{run_id})")
+@click.option("--config", "config_path", default="config/settings.yaml", help="Path a settings.yaml")
+def main(raw_dir, output_dir, min_genes, min_samples, run_id, run_dir, config_path):
     """Agent 3: Preprocesa y realiza QC de datasets GEO."""
-    config = {
-        "min_genes_detected": min_genes,
-        "min_samples_per_group": min_samples,
-    }
-    agent = PreprocessingAgent(config=config)
+    import time as _time
+    from pathlib import Path as _Path
+
+    # Cargar config completo desde settings.yaml si existe
+    base_config = {}
+    cfg_path = _Path(config_path)
+    if cfg_path.exists():
+        try:
+            import yaml as _yaml
+            with open(cfg_path) as f:
+                full_cfg = _yaml.safe_load(f)
+            base_config = full_cfg.get("preprocessing", {})
+        except Exception:
+            pass
+
+    # CLI flags sobreescriben settings.yaml
+    base_config["min_genes_detected"] = min_genes
+    base_config["min_samples_per_group"] = min_samples
+
+    if run_id is None:
+        run_id = f"run_{int(_time.time())}"
+    agent = PreprocessingAgent(config=base_config, run_id=run_id, run_dir=run_dir)
     summary = agent.run(raw_dir, output_dir)
     click.echo(json.dumps(summary, indent=2))
 

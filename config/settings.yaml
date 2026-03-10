@@ -126,9 +126,9 @@ insights:
 # LLM block (alias para InsightGenerationAgent — lee de aquí)
 llm:
   backend: "ollama"           # anthropic | openai | ollama | basic
-  model: "gemma3:4b"         # claude-sonnet-4-20250514 | gemma3:4b
+  model: "gemma3:4b"         # claude-sonnet-4-20250514 | gemma3:4b | llama3.1
   ollama_url: "http://localhost:11434"
-  max_tokens: 4000
+  max_tokens: 5000
   top_genes_for_context: 20
 
 # --- Agent 8: ReportGeneration ---
