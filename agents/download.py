@@ -34,7 +34,7 @@ class DatasetDownloadAgent:
     MATRIX_SUFFIX = "_series_matrix.txt.gz"
 
     CONTROL_KEYWORDS = [
-        "control", "normal", "healthy", "non-tumor", "adjacent",
+        "disease: normal", "control", "normal", "healthy", "non-tumor", "adjacent",
         "wild type", "wt", "vehicle", "untreated", "mock",
         "_c_", " ckp", "ckp_", "wildtype", "parental", "scramble",
         "ctr", "ctrl", "non-ad", "non_ad", "no infection",
@@ -167,26 +167,13 @@ class DatasetDownloadAgent:
             for key, values in gsm.metadata.items():
                 characteristics[key] = values[0] if values else ""
 
-            sample_text = " ".join([
-                characteristics.get("title", ""),
-                characteristics.get("source_name_ch1", ""),
-                characteristics.get("characteristics_ch1", ""),
-                characteristics.get("description", ""),
-            ]).lower()
-
-            label = self._classify_sample(sample_text)
-
             sample_info = {
                 "gsm_id": gsm_id,
                 "title": characteristics.get("title", ""),
-                "label": label,
+                "label": "unclassified",
                 "characteristics": characteristics,
             }
-
-            if label == "unclassified":
-                unclassified.append(sample_info)
-            else:
-                samples.append(sample_info)
+            unclassified.append(sample_info)
 
         gse_title = gse.metadata.get("title", [""])[0]
         n_case = sum(1 for s in samples if s["label"] == "case")
@@ -194,13 +181,13 @@ class DatasetDownloadAgent:
         unclassified_fraction = len(unclassified) / max(n_total, 1)
 
         classifier_result = None
-        if self._classifier and (n_case == 0 or unclassified_fraction > self.UNCLASSIFIED_THRESHOLD):
+        if self._classifier:
             logger.info(
                 f"[{gse.name}] Activando ExperimentDesignClassifier "
                 f"(n_case={n_case}, unclassified={len(unclassified)}/{n_total})"
             )
             all_samples_for_classifier = [
-                {"gsm_id": s["gsm_id"], "title": s["title"]}
+                {"gsm_id": s["gsm_id"], "title": s["title"], "characteristics": s.get("characteristics", {})}
                 for s in (samples + unclassified)
             ]
             classifier_result = self._classifier.classify(
@@ -237,6 +224,27 @@ class DatasetDownloadAgent:
             else:
                 reason = classifier_result.get("validation_message", "desconocido") if classifier_result else "sin respuesta"
                 logger.warning(f"[{gse.name}] ExperimentDesignClassifier inválido: {reason}")
+                # Usar labels aunque invalid si hay al menos 1 case y 1 control
+                if classifier_result and classifier_result.get("n_case", 0) >= 1 and classifier_result.get("n_control", 0) >= 1:
+                    classification_map = classifier_result["classification"]
+                    reclassified = []
+                    still_unclassified = []
+                    for s in (samples + unclassified):
+                        new_label = classification_map.get(s["gsm_id"], "unclassified")
+                        if new_label == "exclude": new_label = "unclassified"
+                        s_updated = {**s, "label": new_label}
+                        if new_label in ("case", "control"):
+                            reclassified.append(s_updated)
+                        else:
+                            still_unclassified.append(s_updated)
+                    samples = reclassified
+                    unclassified = still_unclassified
+                    logger.info(f"[{gse.name}] Clasificacion parcial usada: case={sum(1 for s in samples if s['label']=='case')} control={sum(1 for s in samples if s['label']=='control')}")
+
+        # Extraer archivos suplementarios desde metadatos GEO
+        suppl_files = []
+        for url in gse.metadata.get("supplementary_file", []):
+            suppl_files.append(url.split("/")[-1])
 
         return {
             "gse_id": gse.name,
@@ -251,8 +259,11 @@ class DatasetDownloadAgent:
                 "axes": classifier_result.get("axes", []),
                 "relevant_axis": classifier_result.get("relevant_axis", ""),
                 "reasoning": classifier_result.get("reasoning", ""),
+                "column_id_field": classifier_result.get("column_id_field", "title"),
+                "column_id_example": classifier_result.get("column_id_example", ""),
                 "valid": classifier_result.get("valid", False),
             } if classifier_result else None,
+            "supplementary_files": suppl_files,
         }
 
     def _classify_sample(self, sample_text: str) -> str:
@@ -306,15 +317,64 @@ class DatasetDownloadAgent:
         suppl_dir = dataset_dir / "suppl"
         suppl_dir.mkdir(exist_ok=True)
 
+        PROCESSABLE_EXTS = (".txt.gz", ".tsv.gz", ".csv.gz", ".count.gz", ".counts.gz")
+        RAW_SKIP = ("_RAW.tar", "filelist.txt")
+        METADATA_EXTS = (".xlsx", ".xls")
+        METADATA_KEYWORDS = ["phenotype", "sample", "clinical", "metadata", "annotation", "characteristic", "pheno", "covariate", "group", "info"]
+
+        # Descargar archivos de metadata/fenotipo siempre, independiente del count matrix
+        gse_suppl_all = gse.metadata.get("supplementary_file", [])
+        metadata_files = [
+            url for url in gse_suppl_all
+            if url and url != "NONE"
+            and any(url.endswith(ext) for ext in METADATA_EXTS)
+            and not any(url.endswith(s) for s in RAW_SKIP)
+        ]
+        if metadata_files:
+            logger.info(f"[{gse_id}] Descargando {len(metadata_files)} archivos de metadata/fenotipo")
+            for url in metadata_files:
+                fname = url.split("/")[-1]
+                dest = suppl_dir / fname
+                if not dest.exists():
+                    try:
+                        https_url = url.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
+                        self._download_file(https_url, dest)
+                        logger.debug(f"[{gse_id}] Metadata descargada: {fname}")
+                    except Exception as e:
+                        logger.warning(f"[{gse_id}] Error descargando metadata {fname}: {e}")
+
+        # Prioridad 1: archivos suplementarios procesables a nivel GSE
+        gse_suppl = gse.metadata.get("supplementary_file", [])
+        processable = [
+            url for url in gse_suppl
+            if url and url != "NONE"
+            and any(url.endswith(ext) for ext in PROCESSABLE_EXTS)
+            and not any(url.endswith(s) for s in RAW_SKIP)
+        ]
+
+        if processable:
+            logger.info(f"[{gse_id}] Descargando {len(processable)} archivos suplementarios procesables")
+            for url in processable:
+                fname = url.split("/")[-1]
+                dest = suppl_dir / fname
+                if not dest.exists():
+                    try:
+                        https_url = url.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
+                        self._download_file(https_url, dest)
+                        logger.debug(f"[{gse_id}] Descargado: {fname}")
+                    except Exception as e:
+                        logger.warning(f"[{gse_id}] Error descargando {fname}: {e}")
+            return self._consolidate_count_files(suppl_dir, gse, gse_id)
+
+        # Prioridad 2: RAW.tar como ?ltimo recurso
         gse_num = int(gse_id.replace("GSE", ""))
         gse_stub = f"GSE{str(gse_num)[:-3]}nnn"
         raw_tar_url = (
             f"{self.NCBI_FTP_BASE}/{gse_stub}/{gse_id}/suppl/{gse_id}_RAW.tar"
         )
-
         tar_path = suppl_dir / f"{gse_id}_RAW.tar"
         try:
-            logger.info(f"[{gse_id}] Descargando {gse_id}_RAW.tar...")
+            logger.info(f"[{gse_id}] Sin suplementarios procesables ? intentando RAW.tar")
             self._download_file(raw_tar_url, tar_path)
 
             with tarfile.open(tar_path) as tar:
@@ -328,23 +388,7 @@ class DatasetDownloadAgent:
 
         except Exception as e:
             logger.warning(f"[{gse_id}] No se pudo descargar RAW.tar: {e}")
-            gse_suppl = gse.metadata.get("supplementary_file", [])
-            if gse_suppl:
-                logger.info(f"[{gse_id}] Intentando supplementary a nivel GSE: {len(gse_suppl)} archivos")
-                for url in gse_suppl:
-                    if not url or url == "NONE":
-                        continue
-                    fname = url.split("/")[-1]
-                    dest = suppl_dir / fname
-                    if not dest.exists():
-                        try:
-                            https_url = url.replace("ftp://ftp.ncbi.nlm.nih.gov", "https://ftp.ncbi.nlm.nih.gov")
-                            self._download_file(https_url, dest)
-                            logger.debug(f"[{gse_id}] Descargado: {fname}")
-                        except Exception as e2:
-                            logger.warning(f"[{gse_id}] Error descargando {fname}: {e2}")
-            else:
-                self._download_gsm_supplementary(gse, suppl_dir)
+            self._download_gsm_supplementary(gse, suppl_dir)
 
         return self._consolidate_count_files(suppl_dir, gse, gse_id)
 
