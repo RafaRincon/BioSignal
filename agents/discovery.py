@@ -16,6 +16,9 @@ Uso:
         --output data/discovery/
 """
 
+from dotenv import load_dotenv
+from pathlib import Path as _Path
+load_dotenv(_Path(__file__).parent.parent / ".env")
 import json
 import requests
 import time
@@ -28,7 +31,7 @@ from pydantic import ValidationError
 from utils.geo_utils import NCBIClient
 from schemas.dataset import DatasetMetadata, DiscoveryOutput
 from utils.geo_utils import load_disease_aliases
-
+import os
 
 class DatasetDiscoveryAgent:
     """
@@ -54,6 +57,23 @@ class DatasetDiscoveryAgent:
             api_key=self.config.get("ncbi_api_key", ""),
         )
         self.disease_aliases = load_disease_aliases()
+        # LLM config para clasificación semántica de archivos
+        llm_cfg = self.config.get("llm", {})
+        self.ollama_url = llm_cfg.get("ollama_url", "http://localhost:11434")
+        self.llm_model = llm_cfg.get("model", "gemma3:4b")
+        self.llm_backend = llm_cfg.get("backend", "ollama")
+        self.llm_client = None
+        if self.llm_backend == "openai":
+            import openai as _openai
+            api_key = os.getenv("OPENAI_API_KEY", llm_cfg.get("api_key", ""))
+            base_url = llm_cfg.get("openai_base_url", "")
+            api_version = llm_cfg.get("openai_api_version", "")
+            if api_version and base_url:
+                self.llm_client = _openai.AzureOpenAI(api_key=api_key, azure_endpoint=base_url, api_version=api_version)
+            elif base_url:
+                self.llm_client = _openai.OpenAI(api_key=api_key, base_url=base_url)
+            else:
+                self.llm_client = _openai.OpenAI(api_key=api_key)
 
     def resolve_disease_term(self, disease_name: str) -> str:
         """
@@ -73,79 +93,127 @@ class DatasetDiscoveryAgent:
                 logger.info(f"Enfermedad '{disease_name}' → '{resolved}'")
                 return resolved
         # Si no hay alias, construir query genérico
-        return f"{disease_name} expression profiling"
+        return f'"{disease_name}"[Title]'
 
     def search_datasets(
         self,
         disease_name: str,
         max_datasets: int = 20,
         min_samples: int = 10,
+        max_samples: int = 1000,
         data_types: list = None,
+        organism: str = None,
+        year_start: int = None,
+        year_end: int = None,
     ) -> list[DatasetMetadata]:
-        """
-        Busca y filtra datasets de GEO para una enfermedad dada.
 
-        Args:
-            disease_name: Nombre de la enfermedad a buscar
-            max_datasets: Número máximo de datasets a recuperar
-            min_samples: Mínimo de muestras por dataset
-            data_types: Lista de tipos de datos ['RNA-seq', 'microarray']
-
-        Returns:
-            Lista de DatasetMetadata validados y rankeados
-        """
         if data_types is None:
-            data_types = ["RNA-seq", "microarray"]
+            data_types = ["RNA-seq"]
+
+        DATA_TYPE_FILTERS = {
+            "RNA-seq": '"Expression profiling by high throughput sequencing"[DataSet Type]',
+            "microarray": '"Expression profiling by array"[DataSet Type]',
+        }
 
         query_term = self.resolve_disease_term(disease_name)
-        logger.info(f"Buscando datasets para: '{query_term}'")
+
+        # Filtro nativo de tipo de dato
+        if data_types and len(data_types) == 1 and data_types[0] in DATA_TYPE_FILTERS:
+            query_term = f'{query_term} AND {DATA_TYPE_FILTERS[data_types[0]]}'
+        elif data_types and len(data_types) > 1:
+            type_filters = [DATA_TYPE_FILTERS[dt] for dt in data_types if dt in DATA_TYPE_FILTERS]
+            if type_filters:
+                query_term = f'{query_term} AND ({" OR ".join(type_filters)})'
+
+        # Filtro de organismo
+        if organism:
+            query_term = f'{query_term} AND "{organism}"[Organism]'
+
+        # Filtro de rango de muestras
+        query_term = f'{query_term} AND {min_samples}:{max_samples}[Number of Samples]'
+
+        # Filtro de años
+        if year_start or year_end:
+            y_start = year_start or 2000
+            y_end = year_end or 2026
+            query_term = f'{query_term} AND {y_start}:{y_end}[PDAT]'
+
+        # Solo Series GSE
+        query_term = f'{query_term} AND gse[Entry Type]'
+
+        logger.info(f"Query NCBI: {query_term}")
         logger.info(f"Parámetros: max={max_datasets}, min_samples={min_samples}, tipos={data_types}")
 
-        # Paso 1: esearch — obtener GSE IDs
-        gse_ids = self.ncbi.esearch(
-            db="gds",
-            term=query_term,
-            retmax=max_datasets * 3,  # Buscar 3x para filtrar después
-        )
-        logger.info(f"Encontrados {len(gse_ids)} IDs crudos en GEO")
+        # B?squeda iterativa hasta completar max_datasets procesables (score >= 3)
+        processable = []
+        seen_ids = set()
+        max_attempts = 3
+        attempt = 0
 
-        if not gse_ids:
-            logger.warning(f"No se encontraron datasets para '{query_term}'")
-            return []
+        while len(processable) < max_datasets and attempt < max_attempts:
+            attempt += 1
+            retmax = max_datasets * (attempt + 1)
 
-        # Paso 2: esummary — obtener metadata de cada dataset
-        raw_metadata = self.ncbi.esummary(db="gds", ids=gse_ids)
+            gse_ids = self.ncbi.esearch(
+                db="gds",
+                term=query_term,
+                retmax=retmax,
+            )
+            logger.info(f"Intento {attempt}: {len(gse_ids)} IDs crudos en GEO")
 
-        # Paso 3: Filtrar y validar
-        datasets = []
-        for meta in raw_metadata:
-            try:
-                dataset = self._parse_and_filter(
-                    meta,
-                    min_samples=min_samples,
-                    data_types=data_types,
-                )
-                if dataset:
-                    datasets.append(dataset)
-            except (ValidationError, KeyError) as e:
-                logger.debug(f"Dataset descartado: {e}")
-                continue
+            if not gse_ids:
+                logger.warning(f"No se encontraron datasets para '{query_term}'")
+                break
 
-        logger.info(f"Datasets válidos después de filtros: {len(datasets)}")
+            # Solo procesar IDs nuevos
+            new_ids = [i for i in gse_ids if i not in seen_ids]
+            seen_ids.update(new_ids)
 
-        # Paso 3b: Capa 1 scoring de descargabilidad
-        logger.info("Verificando descargabilidad de datasets...")
-        for d in datasets:
-            d.downloadability_score = self._check_downloadability(d.gse_id)
-            logger.debug(f"  [{d.gse_id}] Downloadability score: {d.downloadability_score}")
+            if not new_ids:
+                logger.info("No hay IDs nuevos disponibles ? agotados los resultados NCBI")
+                break
 
-        # Paso 4: Rankear y limitar
-        ranked = self._rank_datasets(datasets)
+            raw_metadata = self.ncbi.esummary(db="gds", ids=new_ids)
+
+            # Evaluar cada ID nuevo individualmente
+            for meta in raw_metadata:
+                if len(processable) >= max_datasets:
+                    break
+                try:
+                    dataset = self._parse_and_filter(
+                        meta,
+                        min_samples=min_samples,
+                        data_types=data_types,
+                    )
+                    if not dataset:
+                        continue
+                    dataset.downloadability_score, dataset.supplementary_files = self._check_downloadability(dataset.gse_id, summary=getattr(dataset, "summary", ""))
+                    dataset._dl_checked = True
+                    logger.debug(f"  [{dataset.gse_id}] Score: {dataset.downloadability_score} | Archivos: {dataset.supplementary_files}")
+                    if dataset.downloadability_score >= 3:
+                        processable.append(dataset)
+                except (ValidationError, KeyError) as e:
+                    logger.debug(f"Dataset descartado: {e}")
+                    continue
+
+            if len(processable) >= max_datasets:
+                break
+
+            remaining = max_datasets - len(processable)
+            logger.info(f"Intento {attempt}: {len(processable)} procesables, faltan {remaining} ? ampliando b?squeda")
+
+        if len(processable) < max_datasets:
+            logger.warning(
+                f"Solo se encontraron {len(processable)} datasets procesables "
+                f"de {max_datasets} solicitados ? RAW.tar excluidos autom?ticamente"
+            )
+
+        # Rankear y limitar
+        ranked = self._rank_datasets(processable)
         final = ranked[:max_datasets]
 
         logger.success(
-            f"✓ Descubrimiento completado: {len(final)} datasets seleccionados "
-            f"de {len(datasets)} candidatos"
+            f"✓ Descubrimiento completado: {len(final)} datasets seleccionados"
         )
         return final
 
@@ -201,13 +269,127 @@ class DatasetDiscoveryAgent:
             summary=raw_meta.get("summary", "")[:500],
         )
         return dataset
-
-
-    def _check_downloadability(self, gse_id: str) -> int:
+    
+    def _classify_files_with_llm(self, files: list[str]) -> tuple[int, str]:
         """
-        Capa 1: Scoring de descargabilidad consultando supplementary files de GEO.
-        Scores: 3=counts consolidados, 2=RAW.tar, 1=solo series matrix, 0=sin archivos
+        Usa LLM local para clasificar semánticamente archivos suplementarios GEO.
+        El LLM clasifica en categorías de texto; el código asigna el score.
+        Retorna (score, reason). Fallback a (-1, "") si falla.
         """
+        CATEGORY_TO_SCORE = {
+            "RAW_COUNTS": 4,
+            "NORMALIZED": 3,
+            "OTHER": 2,
+            "RAW_ARCHIVE": 1,
+        }
+        try:
+            prompt = (
+                "You are analyzing GEO supplementary filenames for a bioinformatics pipeline.\n\n"
+                f"Files: {files}\n\n"
+                "Classify the BEST available file into exactly one category:\n\n"
+                "RAW_COUNTS: unnormalized integer count matrix ready for DESeq2. "
+                "Examples: GSE254877_raw_counts.txt.gz, GSE312093_gene_count.txt.gz, GSE309948_COUNTS_093022.txt.gz. "
+                "Key signals: words like 'count', 'counts', 'raw_count' in the filename WITHOUT 'normalized'.\n\n"
+                "NORMALIZED: expression matrix that has been normalized. "
+                "Examples: GSE254877_normalized_counts.csv.gz, GSE293164_normalized_gene_counts.csv.gz, GSE254877_fpkm.txt.gz. "
+                "Key signals: words like 'normalized', 'normalised', 'fpkm', 'tpm', 'cpm', 'rpkm' anywhere in the filename.\n\n"
+                "RAW_ARCHIVE: a .tar archive of raw sequencing or microarray files (FASTQ, BAM, CEL). "
+                "Examples: GSE255433_RAW.tar, GSE307642_RAW.tar. "
+                "Key signals: filename ends in _RAW.tar or RAW.tar. "
+                "WARNING: do NOT confuse with RAW_COUNTS — a .tar file is never a count matrix.\n\n"
+                "OTHER: any other file that does not fit the above categories.\n\n"
+                "RULES:\n"
+                "- If multiple files are present, return the category of the BEST one (RAW_COUNTS > NORMALIZED > OTHER > RAW_ARCHIVE).\n"
+                "- If any filename contains 'normalized', 'fpkm', 'tpm', 'cpm', or 'rpkm', category MUST be NORMALIZED unless a RAW_COUNTS file also exists.\n"
+                "- If any filename ends in '.gct.gz' or '.gct', category MUST be OTHER ? GCT format is not supported by the pipeline.\n"
+                "- If the only expression file ends in _RAW.tar, category MUST be RAW_ARCHIVE.\n\n"
+                "Respond ONLY with valid JSON: "
+                "{\"category\": \"<RAW_COUNTS|NORMALIZED|RAW_ARCHIVE|OTHER>\", \"reason\": \"<one sentence>\"}"
+            )
+            raw = self._call_llm(prompt)
+            raw = raw.replace("`json", "").replace("`", "").strip()
+            result = json.loads(raw)
+            category = result.get("category", "").upper()
+            reason = result.get("reason", "")
+            if category not in CATEGORY_TO_SCORE:
+                return -1, ""
+            return CATEGORY_TO_SCORE[category], reason
+        except Exception as e:
+            logger.debug(f"LLM file classification failed: {e}")
+            return -1, ""
+
+    def _call_llm(self, prompt: str) -> str:
+        """Llama al LLM configurado y retorna el texto de respuesta."""
+        if self.llm_backend == "openai":
+            base_url = self.config.get("llm", {}).get("openai_base_url", "")
+            api_version = self.config.get("llm", {}).get("openai_api_version", "")
+            import os as _os; api_key = _os.getenv("OPENAI_API_KEY", self.config.get("llm", {}).get("api_key", ""))
+            url = f"{base_url}/openai/deployments/{self.llm_model}/chat/completions?api-version={api_version}"
+            r = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"messages": [{"role": "user", "content": prompt}], "max_completion_tokens": 500, "response_format": {"type": "json_object"}},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        else:
+            r = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={"model": self.llm_model, "prompt": prompt, "stream": False, "format": "json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.json().get("response", "").strip()
+
+    def _check_case_control(self, gse_id: str, summary: str = "") -> bool:
+        if not summary.strip():
+            return True
+        prompt = (
+            "You are evaluating a GEO dataset for a transcriptomic meta-analysis pipeline.\n\n"
+            f"Dataset: {gse_id}\n"
+            f"Description: {summary.strip()[:600]}\n\n"
+            "Does this dataset have at least TWO distinct biological groups that can be compared "
+            "in a differential expression analysis (e.g. treated vs untreated, disease vs healthy, "
+            "knockout vs wildtype, condition A vs condition B)?\n\n"
+            "STRICT RULES:\n"
+            "- Answer TRUE if the description explicitly mentions two or more distinct comparable groups.\n"
+            "- Answer FALSE if all samples come from a single condition with no comparison group mentioned.\n"
+            "- Answer FALSE if the description is too vague to determine any group structure.\n\n"
+            "Respond ONLY with valid JSON: "
+            '{"has_case_control": true, "reason": "<one sentence>"}'
+        )
+        try:
+            raw = self._call_llm(prompt)
+            result = json.loads(raw)
+            has_cc = result.get("has_case_control", True)
+            reason = result.get("reason", "")
+            logger.debug(f"  [{gse_id}] caso/control={has_cc} ? {reason}")
+            return has_cc
+        except Exception as e:
+            logger.debug(f"[{gse_id}] _check_case_control error: {e}")
+            return True
+
+    def _check_downloadability(self, gse_id: str, summary: str = "") -> tuple[int, list[str]]:
+        """
+        Verifica archivos suplementarios en FTP de NCBI y los clasifica con LLM.
+
+        Scores:
+            4 = count matrix crudo (listo para DESeq2/edgeR)
+            3 = count matrix normalizado (FPKM, TPM, CPM — usable con limma)
+            2 = series matrix u otros tabulares
+            1 = solo RAW.tar (no usable sin infraestructura adicional)
+            0 = sin archivos suplementarios
+
+        Returns:
+            (score, lista de nombres de archivos encontrados)
+        """
+        # Verificar diseno caso/control antes de evaluar archivos
+        if not self._check_case_control(gse_id, summary=summary):
+            logger.debug(f"  [{gse_id}] Sin diseno caso/control ? excluido")
+            return 0, []
+
+        files_found = []
         try:
             gse_num = int(gse_id.replace("GSE", ""))
             prefix = str(gse_num)[:-3] if gse_num >= 1000 else "0"
@@ -217,22 +399,55 @@ class DatasetDiscoveryAgent:
             )
             resp = requests.get(ftp_url, timeout=10)
             if resp.status_code != 200:
-                return 1
-            body = resp.text.lower()
-            count_keywords = [
-                "count", "counts", "rawcounts", "raw_count", "genecounts",
-                "featurecounts", "starcounts", "count_matrix", "readcounts",
-            ]
-            has_counts = any(kw in body for kw in count_keywords)
-            has_tabular = ".csv" in body or ".tsv" in body or ".txt" in body
-            if has_counts and has_tabular:
-                return 3
+                return 2, []
+
+            # Extraer nombres de archivos del HTML del FTP
+            exts = ('.gz', '.tar', '.csv', '.txt', '.tsv', '.xlsx', '.h5', '.loom')
+            for part in resp.text.split('href='):
+                chunk = part.split('"')
+                if len(chunk) > 1:
+                    fname = chunk[1]
+                    if any(fname.lower().endswith(e) for e in exts) and fname not in ('..', ''):
+                        files_found.append(fname)
+
+            if not files_found:
+                return 2, []
+
+            # Pre-selección: si hay count crudo Y normalizado, quedarse solo con el count
+            files_for_llm = files_found
+            body = " ".join(files_found).lower()
+            has_raw_count = any(k in body for k in ["gene_count", "rawcount", "raw_count",
+                                                     "featurecount", "starcounts", "counts_"])
+            has_normalized = any(k in body for k in ["normalized", "fpkm", "tpm", "cpm", "rpkm"])
+            if has_raw_count and has_normalized:
+                files_for_llm = [f for f in files_found if not any(
+                    k in f.lower() for k in ["fpkm", "tpm", "cpm", "rpkm", "normalized"]
+                )]
+
+            # Clasificación semántica con LLM
+            # Excluir RAW.tar antes de pasar al LLM ? nunca es el mejor archivo
+            files_for_llm = [f for f in files_for_llm if not f.endswith("_RAW.tar") and f != "filelist.txt"]
+            if not files_for_llm:
+                return 1, files_found  # solo habia RAW.tar
+            score, reason = self._classify_files_with_llm(files_for_llm)
+            if score >= 0:
+                logger.debug(f"  [{gse_id}] LLM score: {score} — {reason}")
+                return score, files_found
+
+            # Fallback: reglas deterministas si LLM falla
+            logger.debug(f"  [{gse_id}] LLM falló — usando reglas deterministas")
+            body = " ".join(files_found).lower()
+            if any(k in body for k in ["normalized", "normalised", "fpkm", "tpm", "cpm", "rpkm"]):
+                return 3, files_found
+            if any(k in body for k in ["rawcount", "raw_count", "gene_count", "featurecount", "counts_"]):
+                return 4, files_found
             if "_raw.tar" in body:
-                return 2
-            return 1
+                return 1, files_found
+            return 2, files_found
+
         except Exception as e:
             logger.debug(f"[{gse_id}] _check_downloadability error: {e}")
-            return 1
+            return 2, []
 
     def _rank_datasets(self, datasets: list[DatasetMetadata]) -> list[DatasetMetadata]:
         """
@@ -314,8 +529,12 @@ class DatasetDiscoveryAgent:
         disease_name: str,
         max_datasets: int = 20,
         min_samples: int = 10,
+        max_samples: int = 1000,
         data_types: list = None,
         output_dir: str = "data/discovery/",
+        organism: str = None,
+        year_start: int = None,
+        year_end: int = None,
     ) -> Path:
         """
         Ejecuta el pipeline completo del agente.
@@ -338,7 +557,11 @@ class DatasetDiscoveryAgent:
             disease_name=disease_name,
             max_datasets=max_datasets,
             min_samples=min_samples,
+            max_samples=max_samples,
             data_types=data_types,
+            organism=organism,
+            year_start=year_start,
+            year_end=year_end,
         )
 
         output_path = self.save_results(
@@ -360,11 +583,19 @@ class DatasetDiscoveryAgent:
 @click.option("--disease", required=True, help="Nombre de la enfermedad a analizar")
 @click.option("--max-datasets", default=20, show_default=True, help="Máximo datasets a recuperar")
 @click.option("--min-samples", default=10, show_default=True, help="Mínimo muestras por dataset")
-@click.option("--data-types", default="RNA-seq,microarray", show_default=True,
-              help="Tipos de datos separados por coma")
+@click.option("--data-types", default="RNA-seq", show_default=True,
+              help="Tipos de datos: RNA-seq | microarray | RNA-seq,microarray")
 @click.option("--output", default="data/discovery/", show_default=True,
               help="Directorio de salida")
-def main(disease, max_datasets, min_samples, data_types, output):
+@click.option("--organism", default=None, show_default=True,
+              help="Filtro por organismo: 'Homo sapiens', 'Mus musculus', etc.")
+@click.option("--max-samples", default=1000, show_default=True,
+              help="Máximo muestras por dataset")
+@click.option("--year-start", default=None, type=int, show_default=True,
+              help="Año inicio para filtro de publicación, ej: 2015")
+@click.option("--year-end", default=None, type=int, show_default=True,
+              help="Año fin para filtro de publicación, ej: 2026")
+def main(disease, max_datasets, min_samples, data_types, output, organism, max_samples, year_start, year_end):
     """
     Agent 1: Descubrimiento de datasets GEO para una enfermedad dada.
 
@@ -374,13 +605,17 @@ def main(disease, max_datasets, min_samples, data_types, output):
     from utils.geo_utils import load_config
     config = load_config()
 
-    agent = DatasetDiscoveryAgent(config=config.get("discovery", {}))
+    agent = DatasetDiscoveryAgent(config={**config.get("discovery", {}), "llm": config.get("llm", {})})
     agent.run(
         disease_name=disease,
         max_datasets=max_datasets,
         min_samples=min_samples,
+        max_samples=max_samples,
         data_types=data_types.split(","),
         output_dir=output,
+        organism=organism,
+        year_start=year_start,
+        year_end=year_end,
     )
 
 
